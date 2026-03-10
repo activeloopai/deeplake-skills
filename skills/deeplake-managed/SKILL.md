@@ -536,7 +536,14 @@ User wants to ingest data
 |-- Is it a HuggingFace dataset? -> use _huggingface key
 |   `-- client.ingest("table", {"_huggingface": "dataset_name"})
 |
-|-- Is it a domain-specific format (COCO, LeRobot, etc.)? -> use format object
+|-- Is it a LeRobot robotics dataset? -> 3-table design (tasks + frames + episodes)
+|   |-- from deeplake.managed.formats import LeRobotTasks, LeRobotFrames, LeRobotEpisodes
+|   |-- client.ingest("tasks", format=LeRobotTasks(dataset_dir))
+|   |-- client.ingest("frames", format=LeRobotFrames(dataset_dir, chunk_start=0, chunk_end=3))
+|   `-- client.ingest("episodes", format=LeRobotEpisodes(dataset_dir, chunk_start=0, chunk_end=3))
+|   Note: chunk_end is inclusive. Episodes requires git lfs. See examples.md Workflow 7.
+|
+|-- Is it a domain-specific format (COCO, etc.)? -> use format object
 |   |-- Python:  client.ingest("table", format=my_format)
 |   `-- Node.js: await client.ingest("table", null, { format: myFormat })
 |   See formats.md for built-in formats: CocoPanoptic, Coco, LeRobot, custom
@@ -598,21 +605,35 @@ User wants to query data
 ```
 User wants to train / iterate over data
 |
-|-- Need PyTorch DataLoader?
+|-- Fast native batch iteration (RECOMMENDED for large datasets)?
+|   |-- ds = client.open_table("table")
+|   |   for batch in ds.batches(256):  # dict of numpy arrays
+|   |       states = torch.tensor(np.stack([batch[c] for c in cols], axis=1))
+|   |-- For column subsets, use query first:
+|   |   view = ds.query("SELECT col1, col2 WHERE episode_index < 100")
+|   `   for batch in view.batches(256): ...
+|
+|-- Need PyTorch DataLoader (small datasets or need shuffle)?
 |   `-- ds = client.open_table("table")
 |      loader = DataLoader(ds.pytorch(), batch_size=32, shuffle=True)
+|      NOTE: Slower on large remote datasets — prefer ds.batches() above
 |
 |-- Need TensorFlow tf.data?
 |   `-- ds = client.open_table("table")
 |      tf_ds = ds.tensorflow().batch(32).prefetch(AUTOTUNE)
 |
-|-- Need simple batch iteration?
-|   `-- ds = client.open_table("table")
-|      for batch in ds.batches(32): ...
-|
-`-- Need async prefetch per row?
-    `-- ds = client.open_table("table")
-       await row.get_async("image")
+`-- Training on LeRobot data?
+    |-- Behavior cloning (state->action):
+    |   ds = client.open_table("droid_frames")
+    |   view = ds.query("SELECT state_x, ..., action_x, ... WHERE episode_index < 100")
+    |   for batch in view.batches(256):
+    |       states = torch.tensor(np.stack([batch[c] for c in STATE_COLS], axis=1))
+    |       actions = torch.tensor(np.stack([batch[c] for c in ACTION_COLS], axis=1))
+    |       # train(model, states, actions)
+    |
+    `-- Video-conditioned training:
+        ds = client.open_table("droid_episodes")
+        # Access video bytes via ds[i]["exterior_1_video"], etc.
 ```
 
 ### Decision: Error Recovery
