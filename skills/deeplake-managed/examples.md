@@ -156,7 +156,97 @@ for row in rows:
     print(f"Image {row['filename']}: {row['num_objects']} objects, captions: {caps}")
 ```
 
-### Workflow 7: Node.js -- Ingest and Query (TypeScript)
+### Workflow 7: Ingest LeRobot Robotics Dataset and Connect to Training (Python)
+
+```python
+from deeplake import Client
+from deeplake.managed.formats import LeRobotTasks, LeRobotFrames, LeRobotEpisodes
+
+client = Client()
+
+DATASET_DIR = "/path/to/lerobot_dataset"  # HuggingFace LeRobot v2.0 format
+
+# LeRobot uses a 3-table design: tasks, frames, episodes.
+# Ingest them in order (tasks first — it's the lookup table).
+
+# 1. Tasks — fast, reads meta/tasks.jsonl (~31K rows for DROID)
+client.ingest("droid_tasks", format=LeRobotTasks(DATASET_DIR))
+
+# 2. Frames — per-frame state/action scalars from parquet files
+#    chunk_start/chunk_end control which chunks to process (inclusive)
+#    Each chunk = 1000 episodes. DROID has 93 chunks total.
+client.ingest("droid_frames", format=LeRobotFrames(
+    DATASET_DIR, chunk_start=0, chunk_end=3,  # first 4 chunks
+))
+
+# 3. Episodes — video data + metadata, pulls LFS videos lazily per chunk
+#    Each chunk's videos are pulled via git-lfs, processed, then freed.
+#    ~40s per chunk (LFS pull + read 3 camera MP4s per episode).
+client.ingest("droid_episodes", format=LeRobotEpisodes(
+    DATASET_DIR, chunk_start=0, chunk_end=3,
+))
+
+# Query frame data
+frames = client.query("""
+    SELECT episode_index, frame_index, state_x, state_y, action_x, action_y
+    FROM droid_frames
+    WHERE episode_index = 0
+    ORDER BY frame_index
+    LIMIT 10
+""")
+for f in frames:
+    print(f"Frame {f['frame_index']}: state=({f['state_x']:.3f}, {f['state_y']:.3f})")
+
+# Connect to training — open_table() bypasses SQL, returns native dataset
+ds = client.open_table("droid_frames")
+print(f"Dataset: {len(ds)} frames")
+
+# RECOMMENDED: Use ds.query() + ds.batches() for fast training on large datasets.
+# ds.pytorch() with DataLoader works but is slower on remote data due to per-row access.
+import torch
+import torch.nn as nn
+import numpy as np
+
+STATE_COLS = ["state_x","state_y","state_z","state_roll","state_pitch","state_yaw","state_pad","state_gripper"]
+ACTION_COLS = ["action_x","action_y","action_z","action_roll","action_pitch","action_yaw","action_gripper"]
+
+# Get a training subset (query runs server-side, fast)
+train_view = ds.query("SELECT state_x, state_y, state_z, state_roll, state_pitch, state_yaw, state_pad, state_gripper, action_x, action_y, action_z, action_roll, action_pitch, action_yaw, action_gripper WHERE episode_index < 100")
+
+# Simple behavior cloning model
+model = nn.Sequential(nn.Linear(8, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 7))
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+for epoch in range(3):
+    total_loss = 0
+    n = 0
+    for batch in train_view.batches(256):  # dict of numpy arrays, very fast
+        states = torch.tensor(np.stack([batch[c] for c in STATE_COLS], axis=1), dtype=torch.float32)
+        actions = torch.tensor(np.stack([batch[c] for c in ACTION_COLS], axis=1), dtype=torch.float32)
+        loss = nn.MSELoss()(model(states), actions)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+        n += 1
+    print(f"Epoch {epoch}: loss={total_loss/n:.6f}")
+```
+
+**Important notes for LeRobot ingestion:**
+- `chunk_end` is **inclusive** — `chunk_start=0, chunk_end=3` processes chunks 0, 1, 2, 3
+- Videos require `git lfs` installed and the dataset cloned (not just downloaded)
+- Episodes ingestion pulls ~40s per chunk for LFS, then restores pointers to save disk
+- For large datasets, ingest in stages: do chunks 0-9 first, verify, then continue
+- Tables support **append**: call `ingest()` again with the same table name and different chunk range to add more data
+- Dependencies: `pandas`, `numpy` (for frames); `git lfs` (for episodes)
+
+**Training performance notes:**
+- `ds.batches(N)` returns dicts of numpy arrays — ~10x faster than `DataLoader(ds.pytorch())`
+- Use `ds.query("SELECT ... WHERE ...")` to filter columns/rows server-side before training
+- 3 epochs over 19K frames completes in ~10s with `ds.batches(256)`
+- For PyTorch DataLoader compatibility (e.g., shuffling), use on smaller subsets only
+
+### Workflow 8: Node.js -- Ingest and Query (TypeScript)
 
 ```typescript
 import { ManagedClient, CocoPanoptic } from '@deeplake/node';
