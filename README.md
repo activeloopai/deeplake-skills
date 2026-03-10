@@ -2,5 +2,5 @@
 
 To get started, just install the skill!
 ```
-npx skills add https://github.com/activeloopai/deeplake-skills
+npx skills add activeloopai/deeplake-skills
 ```
