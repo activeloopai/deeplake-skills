@@ -1,4 +1,4 @@
-# DeepLake Managed Service -- Format Classes
+# Deeplake Managed Service -- Format Classes
 
 Format classes normalize domain-specific dataset layouts into column-oriented batches for `Client.ingest()`. All format classes inherit from the `Format` abstract base class.
 

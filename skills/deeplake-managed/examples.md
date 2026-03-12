@@ -1,4 +1,4 @@
-# DeepLake Managed Service -- Examples
+# Deeplake Managed Service -- Examples
 
 ## Complete Workflow Examples
 

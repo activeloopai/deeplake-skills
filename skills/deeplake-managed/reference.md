@@ -1,4 +1,4 @@
-# DeepLake Managed Service -- Reference
+# Deeplake Managed Service -- Reference
 
 ## pg_deeplake SQL Reference
 
@@ -146,7 +146,7 @@ await client.ingest("documents", data, { index: ["embedding", "text"] });
 | `MEDICAL`      | bytes       | Buffer/Uint8Array | MEDICAL (bytea)           | Medical imaging (DICOM) |
 | `FILE`         | str (path)  | string (path)     | N/A (processed)           | `"/path/to/file.mp4"`   |
 
-> **Note:** `EMBEDDING` is a DeepLake schema type that maps to `float4[]` in PostgreSQL. pg_deeplake treats these columns specially for vector similarity search via the `<#>` operator and `deeplake_index`.
+> **Note:** `EMBEDDING` is a Deeplake schema type that maps to `float4[]` in PostgreSQL. pg_deeplake treats these columns specially for vector similarity search via the `<#>` operator and `deeplake_index`.
 >
 > **Note:** `FILE` is a schema directive, not a storage type. Columns marked as `FILE` are treated as file paths during ingestion -- the files are processed (chunked, etc.) and the resulting data is stored in generated columns. The `FILE` column itself is not stored in the dataset.
 >
