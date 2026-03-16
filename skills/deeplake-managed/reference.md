@@ -37,6 +37,8 @@ for row in results:
 
 ### BM25 Text Search
 
+> **Important:** Use the `<#>` operator for BM25 search. The `BM25_SIMILARITY()` function form is **not supported** on the managed query endpoint and will return a 400 error.
+
 ```sql
 -- <#> on text column: BM25 text similarity (higher = more relevant)
 SELECT id, text, text <#> 'search query' AS score
@@ -120,6 +122,36 @@ await client.createIndex("documents", "text");
 await client.ingest("documents", data, { index: ["embedding", "text"] });
 ```
 
+### Raw SQL: Inserting Image Bytes
+
+When inserting image data via raw SQL (not `client.ingest()`), use `decode()` with the `IMAGE` cast:
+
+```sql
+INSERT INTO images (id, img)
+VALUES ('img_1', decode('89504e470d0a1a0a...', 'hex')::IMAGE);
+```
+
+```python
+image_hex = image_bytes.hex()
+client.query(
+    "INSERT INTO images (id, img) VALUES ($1, decode($2, 'hex')::IMAGE)",
+    ("img_1", image_hex)
+)
+```
+
+### Raw SQL: Vector Literals
+
+When using vector values as SQL literals (e.g. for benchmarking without parameterized queries):
+
+```sql
+SELECT id, text, embedding <#> ARRAY[0.1, 0.2, 0.3]::FLOAT4[] AS score
+FROM documents
+ORDER BY score DESC
+LIMIT 10;
+```
+
+> **Tip:** For production use, prefer parameterized queries (`$1`) over literals.
+
 ---
 
 ## Data Types Reference
@@ -151,6 +183,18 @@ await client.ingest("documents", data, { index: ["embedding", "text"] });
 > **Note:** `FILE` is a schema directive, not a storage type. Columns marked as `FILE` are treated as file paths during ingestion -- the files are processed (chunked, etc.) and the resulting data is stored in generated columns. The `FILE` column itself is not stored in the dataset.
 >
 > **Note:** Domain types like `IMAGE`, `SEGMENT_MASK`, `BINARY_MASK`, `BOUNDING_BOX`, `CLASS_LABEL`, `DEEPLAKE_POLYGON`, `DEEPLAKE_POINT`, `MESH`, and `MEDICAL` are PostgreSQL domain types defined by pg_deeplake. They behave like their base types (bytea, float4[], int4) but carry semantic meaning for visualization, search, and type-aware processing.
+>
+> **Important -- IMAGE columns for UI display:** To display images correctly in the UI, explicitly set `schema={"image_col": "IMAGE"}` during ingestion. Without this, bytes columns are stored as generic `BINARY` and the UI will not render them as images.
+>
+> **Important -- IMAGE query results:** IMAGE columns returned via `client.query()` may come back as **base64-encoded strings** rather than raw bytes, depending on the backend serialization. Always handle both types:
+> ```python
+> import base64
+> val = row["image"]
+> if isinstance(val, str):
+>     image_bytes = base64.b64decode(val)
+> else:
+>     image_bytes = val
+> ```
 
 **Schema inference:**
 - `bool` / `boolean` -> BOOL
@@ -184,7 +228,7 @@ When a format declares `image_columns()`, the SDK auto-generates a shared `thumb
 | Video chunk duration         | 10 seconds      |
 | Text chunk size (default)    | 1000 characters |
 | Text chunk overlap (default) | 200 characters  |
-| PDF rendering resolution     | 300 DPI         |
+| PDF rendering resolution     | 150 DPI (configurable via `pdf_dpi`) |
 | Batch size (data ingest)     | 1000 rows       |
 | Write buffer (flush_every)   | 200 rows        |
 | Commit interval              | 2000 rows       |
@@ -270,6 +314,31 @@ npm install sharp
 ```bash
 # Check API server is running
 curl https://api.deeplake.ai/health
+```
+
+**"Not found: /workspaces/.../tables" during ingest:**
+```
+# The workspace must exist before calling ingest().
+# Create it via the API or UI first, then ingest.
+```
+
+**Tables created via raw SQL not visible to ingest():**
+```
+# Tables created with raw SQL (CREATE TABLE ... USING deeplake) are not
+# registered with the managed API. The SDK expects tables created via
+# POST /workspaces/{id}/tables, which registers the al:// path.
+# Use client.ingest() to create tables, or use client.query() for raw SQL
+# operations on manually-created tables.
+```
+
+**Query timeout on large datasets:**
+```python
+# Python: increase timeout (default 60s)
+results = client.query("SELECT COUNT(*) FROM big_table", timeout=300)
+```
+```typescript
+// Node.js: increase timeout (default 60s)
+const rows = await client.query("SELECT COUNT(*) FROM big", undefined, { timeoutMs: 300_000 });
 ```
 
 **Note:** All database operations (query, list_tables, drop_table, create_table) go through the REST API. No direct PostgreSQL connection is needed from the Python or Node.js client.
