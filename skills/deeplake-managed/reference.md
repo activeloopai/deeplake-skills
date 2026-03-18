@@ -316,6 +316,13 @@ npm install sharp
 curl https://api.deeplake.ai/health
 ```
 
+**"workspace ID is required" when creating a workspace (HTTP 400):**
+```
+# POST /workspaces requires the "id" field in the request body.
+# The "id" is used in API paths and al:// URLs.
+# Example: { "id": "my-workspace", "name": "My Workspace" }
+```
+
 **"Not found: /workspaces/.../tables" during ingest:**
 ```
 # The workspace must exist before calling ingest().

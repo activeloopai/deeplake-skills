@@ -471,6 +471,57 @@ await client.ingest("search_index", {
 
 ---
 
+## Workspace Management
+
+Workspaces are created via the REST API. The SDK clients don't have a built-in `createWorkspace()` method — use `apiRequest` directly.
+
+**Important:** The `id` field is **required** when creating a workspace. Omitting it returns an error.
+
+```typescript
+// Node.js — create workspace via API
+import { apiRequest, extractOrgId } from 'deeplake';
+
+const orgId = extractOrgId(token);
+await apiRequest(apiUrl, token, orgId, {
+    method: 'POST',
+    path: '/workspaces',
+    body: { id: 'my-workspace', name: 'My Workspace' },
+    timeoutMs: 30_000,
+});
+```
+
+```python
+# Python — create workspace via API
+import requests
+
+resp = requests.post(
+    f"{api_url}/workspaces",
+    headers={"Authorization": f"Bearer {token}"},
+    json={"id": "my-workspace", "name": "My Workspace"},
+)
+resp.raise_for_status()
+```
+
+**List workspaces:**
+
+```typescript
+// Node.js
+const resp = await apiRequest(apiUrl, token, orgId, {
+    method: 'GET',
+    path: '/workspaces',
+});
+// resp.data = [{ id, org_id, name, type, created_at }, ...]
+```
+
+| Field    | Required | Description                                       |
+| -------- | -------- | ------------------------------------------------- |
+| `id`     | **Yes**  | Workspace identifier (used in API paths and `al://` URLs) |
+| `name`   | No       | Display name (defaults to `id` if omitted)        |
+
+> **Note:** Omitting `id` returns HTTP 400 Bad Request with the message "workspace ID is required".
+
+---
+
 ## Error Handling
 
 Both Python and Node.js share the same error hierarchy:
@@ -684,6 +735,10 @@ Operation failed with error
 |   |-- "Table already exists" -> Use drop_table() first or different name
 |   |-- "Index creation failed" -> Check column exists and is EMBEDDING or TEXT type
 |   `-- "Query timed out" -> Increase timeout: client.query(sql, timeout=300)
+|
+|-- WorkspaceError / "workspace ID is required"?
+|   `-- POST /workspaces requires the "id" field in the request body.
+|      Use: { id: "my-ws", name: "My Workspace" }
 |
 |-- "Not found: /workspaces/.../tables"?
 |   `-- Workspace must exist before ingest(). Create it via the API or UI first.
