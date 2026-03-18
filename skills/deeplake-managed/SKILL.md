@@ -52,10 +52,16 @@ from deeplake.managed import AsyncClient
 
 **TypeScript import:**
 ```typescript
-import { ManagedClient } from '@deeplake/node';
+import { ManagedClient, initializeWasm } from 'deeplake';
 // or from local build:
-import { ManagedClient } from '/home/ubuntu/indra/typescript/node/dist';
+import { ManagedClient, initializeWasm } from '/home/ubuntu/indra/typescript/node/dist';
 ```
+
+**WASM initialization (required before any operations):**
+```typescript
+await initializeWasm();
+```
+Call `initializeWasm()` once at startup before any `ManagedClient` operations (ingest, query, etc.). It initializes the underlying WASM module.
 
 ---
 
@@ -106,7 +112,9 @@ client.create_index("embeddings", "embedding")
 ### Node.js / TypeScript
 
 ```typescript
-import { ManagedClient } from '@deeplake/node';
+import { ManagedClient, initializeWasm } from 'deeplake';
+
+await initializeWasm();
 
 const client = new ManagedClient({ token: 'dl_xxx', workspaceId: 'my-workspace' });
 
@@ -180,7 +188,9 @@ client = Client(
 ### Node.js / TypeScript
 
 ```typescript
-import { ManagedClient } from '@deeplake/node';
+import { ManagedClient, initializeWasm } from 'deeplake';
+
+await initializeWasm();
 
 const client = new ManagedClient({
     token: string,               // API token (required)
@@ -351,6 +361,7 @@ results = (
 
 ```typescript
 // Node.js: use .execute() only (no () shorthand)
+// (assumes initializeWasm() already called at startup)
 const results = await client.table("videos")
     .select("id", "text", "start_time")
     .where("file_id = $1", "abc123")
@@ -487,7 +498,7 @@ from deeplake.managed import (
 import {
     ManagedServiceError, AuthError, CredentialsError,
     IngestError, TableError, TokenError, WorkspaceError,
-} from '@deeplake/node';
+} from 'deeplake';
 ```
 
 | Error                                      | Cause                     | Solution                                                    |
@@ -520,7 +531,9 @@ Need to create a Client
 |       `-- client = Client(api_url="http://custom:8080")
 |
 `-- Node.js?
-    `-- const client = new ManagedClient({
+    `-- import { ManagedClient, initializeWasm } from 'deeplake';
+        await initializeWasm();
+        const client = new ManagedClient({
            token: process.env.DEEPLAKE_API_KEY!,
            workspaceId: "my-ws",        // optional, default "default"
            apiUrl: "http://custom:8080", // optional
