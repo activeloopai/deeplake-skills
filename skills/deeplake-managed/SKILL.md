@@ -52,10 +52,16 @@ from deeplake.managed import AsyncClient
 
 **TypeScript import:**
 ```typescript
-import { ManagedClient } from '@deeplake/node';
+import { ManagedClient, initializeWasm } from 'deeplake';
 // or from local build:
-import { ManagedClient } from '/home/ubuntu/indra/typescript/node/dist';
+import { ManagedClient, initializeWasm } from '/home/ubuntu/indra/typescript/node/dist';
 ```
+
+**WASM initialization (required before any operations):**
+```typescript
+await initializeWasm();
+```
+Call `initializeWasm()` once at startup before any `ManagedClient` operations (ingest, query, etc.). It initializes the underlying WASM module.
 
 ---
 
@@ -106,7 +112,9 @@ client.create_index("embeddings", "embedding")
 ### Node.js / TypeScript
 
 ```typescript
-import { ManagedClient } from '@deeplake/node';
+import { ManagedClient, initializeWasm } from 'deeplake';
+
+await initializeWasm();
 
 const client = new ManagedClient({ token: 'dl_xxx', workspaceId: 'my-workspace' });
 
@@ -180,7 +188,9 @@ client = Client(
 ### Node.js / TypeScript
 
 ```typescript
-import { ManagedClient } from '@deeplake/node';
+import { ManagedClient, initializeWasm } from 'deeplake';
+
+await initializeWasm();
 
 const client = new ManagedClient({
     token: string,               // API token (required)
@@ -189,7 +199,7 @@ const client = new ManagedClient({
 });
 ```
 
-**Token:** Falls back to the `DEEPLAKE_API_KEY` environment variable (Python only). The token is a JWT; `org_id` is extracted automatically from the JWT claims. If the token doesn't contain an `org_id` claim, the client falls back to fetching it from the `/me` API endpoint.
+**Token:** Create API tokens from the Deeplake platform at `https://app.deeplake.ai/<org_name>/workspace/<workspace>/apitoken`. The token is a JWT with `org_id` embedded. Falls back to the `DEEPLAKE_API_KEY` environment variable (Python only).
 
 **Backend endpoint:** The client sets the C++ backend endpoint to `api_url` before each dataset open (not on initialization) so that `al://` path resolution (credential fetching) goes through deeplake-api instead of the legacy controlplane. This avoids global state clobbering when multiple clients use different API URLs. Python: `deeplake.client.endpoint = api_url`. Node.js: `deeplakeSetEndpoint(apiUrl)`.
 
@@ -226,6 +236,7 @@ result = client.ingest(
     on_progress: Callable = None,       # Progress callback(rows_written, total)
     chunk_size: int = 1000,             # Text chunk size (chars)
     chunk_overlap: int = 200,           # Text chunk overlap (chars)
+    pdf_dpi: int = 150,                 # PDF render DPI (higher = sharper but slower)
 ) -> dict
 ```
 
@@ -260,7 +271,7 @@ const result = await client.ingest(
 | --------- | ------------------------------------ | ------------------------------- | --------------------------------------------------------------------------- |
 | **Video** | .mp4, .mov, .avi, .mkv, .webm        | 10-second segments + thumbnails | id, file_id, chunk_index, start_time, end_time, video_data, thumbnail, text |
 | **Image** | .jpg, .jpeg, .png, .gif, .bmp, .webp | Single chunk                    | id, file_id, image, filename, text                                          |
-| **PDF**   | .pdf                                 | Page-by-page at 300 DPI         | id, file_id, page_index, image, text                                        |
+| **PDF**   | .pdf                                 | Page-by-page at 150 DPI (configurable via `pdf_dpi`) | id, file_id, page_index, image, text                                        |
 | **Text**  | .txt, .md, .csv, .json, .xml, .html  | 1000 char chunks, 200 overlap   | id, file_id, chunk_index, text                                              |
 | **Other** | *                                    | Single binary chunk             | id, file_id, data, filename                                                 |
 
@@ -350,6 +361,7 @@ results = (
 
 ```typescript
 // Node.js: use .execute() only (no () shorthand)
+// (assumes initializeWasm() already called at startup)
 const results = await client.table("videos")
     .select("id", "text", "start_time")
     .where("file_id = $1", "abc123")
@@ -375,23 +387,35 @@ const results = await client.table("videos")
 
 ```python
 # Python
-rows = client.query(sql: str, params: tuple = None) -> list[dict]
+rows = client.query(
+    sql: str,
+    params: tuple = None,
+    timeout: int = 60,       # HTTP timeout in seconds (increase for slow queries)
+) -> list[dict]
 
 # Examples
 rows = client.query("SELECT * FROM videos LIMIT 10")
 rows = client.query("SELECT * FROM documents WHERE file_id = $1", ("abc123",))
+rows = client.query("SELECT COUNT(*) FROM big_table", timeout=300)  # 5-minute timeout
 ```
 
 ```typescript
 // Node.js
-const rows = await client.query(sql: string, params?: unknown[]) -> Promise<QueryRow[]>
+const rows = await client.query(
+    sql: string,
+    params?: unknown[],
+    options?: { timeoutMs?: number },  // default 60000 (60s)
+) -> Promise<QueryRow[]>
 
 // Examples
 const rows = await client.query("SELECT * FROM videos LIMIT 10");
 const rows = await client.query("SELECT * FROM documents WHERE file_id = $1", ["abc123"]);
+const rows = await client.query("SELECT COUNT(*) FROM big", undefined, { timeoutMs: 300_000 });
 ```
 
 Queries are sent to the API via `POST /workspaces/{id}/tables/query`. Use `$1`, `$2`, ... for parameterized queries.
+
+> **Timeout:** The default query timeout is 60 seconds. For long-running queries (large aggregations, index builds), increase it via the `timeout` / `timeoutMs` parameter. Non-default timeouts are forwarded to the backend as `timeout_ms` so the server can also apply a deadline.
 
 > For pg_deeplake SQL features (vector search, BM25, hybrid search, indexes), see [reference.md](reference.md).
 
@@ -474,7 +498,7 @@ from deeplake.managed import (
 import {
     ManagedServiceError, AuthError, CredentialsError,
     IngestError, TableError, TokenError, WorkspaceError,
-} from '@deeplake/node';
+} from 'deeplake';
 ```
 
 | Error                                      | Cause                     | Solution                                                    |
@@ -507,7 +531,9 @@ Need to create a Client
 |       `-- client = Client(api_url="http://custom:8080")
 |
 `-- Node.js?
-    `-- const client = new ManagedClient({
+    `-- import { ManagedClient, initializeWasm } from 'deeplake';
+        await initializeWasm();
+        const client = new ManagedClient({
            token: process.env.DEEPLAKE_API_KEY!,
            workspaceId: "my-ws",        // optional, default "default"
            apiUrl: "http://custom:8080", // optional
@@ -656,7 +682,16 @@ Operation failed with error
 |-- TableError?
 |   |-- "create_deeplake_table failed" -> Check pg_deeplake extension
 |   |-- "Table already exists" -> Use drop_table() first or different name
-|   `-- "Index creation failed" -> Check column exists and is EMBEDDING or TEXT type
+|   |-- "Index creation failed" -> Check column exists and is EMBEDDING or TEXT type
+|   `-- "Query timed out" -> Increase timeout: client.query(sql, timeout=300)
+|
+|-- "Not found: /workspaces/.../tables"?
+|   `-- Workspace must exist before ingest(). Create it via the API or UI first.
+|
+|-- Tables created via raw SQL not visible to ingest()?
+|   `-- Raw SQL tables (CREATE TABLE ... USING deeplake) are not registered with
+|      the managed API. Use client.ingest() to create tables. Use client.query()
+|      for raw SQL operations on manually-created tables.
 |
 |-- Thumbnail generation failed? (logged as warning, non-fatal)
 |   |-- Python: Install Pillow (`pip install Pillow`)

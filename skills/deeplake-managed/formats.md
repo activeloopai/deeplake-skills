@@ -35,7 +35,7 @@ class Format(ABC):
 ### Node.js / TypeScript
 
 ```typescript
-import type { Format, Batch, SchemaMap } from '@deeplake/node';
+import type { Format, Batch, SchemaMap } from 'deeplake';
 
 interface Format {
     normalize(): Iterable<Batch> | AsyncIterable<Batch>;
@@ -227,7 +227,7 @@ client.ingest("panoptic", format=CocoPanoptic(
 
 ```typescript
 // Node.js
-import { CocoPanoptic } from '@deeplake/node';
+import { CocoPanoptic } from 'deeplake';
 
 await client.ingest("panoptic", null, {
     format: new CocoPanoptic({
@@ -274,7 +274,7 @@ client.ingest("coco_train", format=Coco(
 
 ```typescript
 // Node.js (no external deps -- pure JS mask rendering)
-import { Coco } from '@deeplake/node';
+import { Coco } from 'deeplake';
 
 await client.ingest("coco_train", null, {
     format: new Coco({
@@ -319,7 +319,7 @@ client.ingest("episodes", format=LeRobotEpisodes(dataset_dir="lerobot_data", chu
 
 ```typescript
 // Node.js
-import { LeRobotTasks, LeRobotFrames, LeRobotEpisodes } from '@deeplake/node';
+import { LeRobotTasks, LeRobotFrames, LeRobotEpisodes } from 'deeplake';
 
 await client.ingest("tasks", null, { format: new LeRobotTasks({ datasetDir: "lerobot_data" }) });
 await client.ingest("frames", null, { format: new LeRobotFrames({ datasetDir: "lerobot_data", chunkStart: 0, chunkEnd: 10 }) });

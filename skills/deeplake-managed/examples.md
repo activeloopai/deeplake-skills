@@ -249,7 +249,9 @@ for epoch in range(3):
 ### Workflow 8: Node.js -- Ingest and Query (TypeScript)
 
 ```typescript
-import { ManagedClient, CocoPanoptic } from '@deeplake/node';
+import { ManagedClient, CocoPanoptic, initializeWasm } from 'deeplake';
+
+await initializeWasm();
 
 const client = new ManagedClient({
     token: process.env.DEEPLAKE_API_KEY!,
@@ -285,7 +287,9 @@ console.log("Tables:", tables);
 ### Workflow 8: Node.js -- Ingest Structured Data (TypeScript)
 
 ```typescript
-import { ManagedClient } from '@deeplake/node';
+import { ManagedClient, initializeWasm } from 'deeplake';
+
+await initializeWasm();
 
 const client = new ManagedClient({
     token: process.env.DEEPLAKE_API_KEY!,
