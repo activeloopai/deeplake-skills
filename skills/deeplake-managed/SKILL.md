@@ -126,25 +126,18 @@ await client.createIndex("embeddings", "embedding");
 **Required services:**
 - Deeplake API server running (default: `https://api.deeplake.ai`)
 
-**Required Python packages:**
-- `requests` (`pip install requests`)
-
-**Optional dependencies (per file type):**
+**Optional python dependencies (per file type):**
 - Video ingestion: `ffmpeg` (`sudo apt-get install ffmpeg`)
 - PDF ingestion: `pymupdf` (`pip install pymupdf`)
 - Thumbnail generation: `Pillow` (`pip install Pillow`)
 - COCO detection format: `pycocotools`, `Pillow`, `numpy` (`pip install pycocotools Pillow numpy`)
 - LeRobot frames format: `pandas`, `numpy` (`pip install pandas numpy`)
 
-**Required packages:**
-- WASM module built from C++ (see memory notes for build commands)
-
-**Optional dependencies (per file type):**
+**Optional typescript dependencies (per file type):**
 - Video ingestion: `ffmpeg` (system binary)
 - PDF ingestion: `pdfjs-dist` (`npm install pdfjs-dist`)
 - Thumbnail generation: `sharp` (`npm install sharp`)
 - COCO detection format: no external deps (pure JS mask rendering)
-
 
 ## Architecture
 
