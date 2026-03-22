@@ -12,62 +12,22 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep, WebFetch
 
 ---
 
-## Prerequisites
-
-**Required services:**
-- Deeplake API server running (default: `https://api.deeplake.ai`)
+## Quick Reference
 
 ### Python
 
-**Required Python packages:**
-- `requests` (`pip install requests`)
-
-**Optional dependencies (per file type):**
-- Video ingestion: `ffmpeg` (`sudo apt-get install ffmpeg`)
-- PDF ingestion: `pymupdf` (`pip install pymupdf`)
-- Thumbnail generation: `Pillow` (`pip install Pillow`)
-- COCO detection format: `pycocotools`, `Pillow`, `numpy` (`pip install pycocotools Pillow numpy`)
-- LeRobot frames format: `pandas`, `numpy` (`pip install pandas numpy`)
+```bash
+pip install deeplake # uv add deeplake 
+```
 
 **Python import (primary):**
 ```python
 from deeplake import Client
-# or equivalently:
-from deeplake.managed import Client
 
 # Async variant (requires aiohttp: pip install aiohttp):
 from deeplake.managed import AsyncClient
 ```
 
-### Node.js / TypeScript
-
-**Required packages:**
-- WASM module built from C++ (see memory notes for build commands)
-
-**Optional dependencies (per file type):**
-- Video ingestion: `ffmpeg` (system binary)
-- PDF ingestion: `pdfjs-dist` (`npm install pdfjs-dist`)
-- Thumbnail generation: `sharp` (`npm install sharp`)
-- COCO detection format: no external deps (pure JS mask rendering)
-
-**TypeScript import:**
-```typescript
-import { ManagedClient, initializeWasm } from 'deeplake';
-// or from local build:
-import { ManagedClient, initializeWasm } from '/home/ubuntu/indra/typescript/node/dist';
-```
-
-**WASM initialization (required before any operations):**
-```typescript
-await initializeWasm();
-```
-Call `initializeWasm()` once at startup before any `ManagedClient` operations (ingest, query, etc.). It initializes the underlying WASM module.
-
----
-
-## Quick Reference
-
-### Python
 
 ```python
 from deeplake import Client
@@ -111,6 +71,22 @@ client.create_index("embeddings", "embedding")
 
 ### Node.js / TypeScript
 
+```
+npm install deeplake
+```
+
+**TypeScript import:**
+```typescript
+import { ManagedClient, initializeWasm } from 'deeplake';
+```
+
+**WASM initialization (required before any operations):**
+```typescript
+await initializeWasm();
+```
+Call `initializeWasm()` once at startup before any `ManagedClient` operations (ingest, query, etc.). It initializes the underlying WASM module.
+
+
 ```typescript
 import { ManagedClient, initializeWasm } from 'deeplake';
 
@@ -144,6 +120,31 @@ await client.createIndex("embeddings", "embedding");
 ```
 
 ---
+
+## Dependancies and Prerequisite
+
+**Required services:**
+- Deeplake API server running (default: `https://api.deeplake.ai`)
+
+**Required Python packages:**
+- `requests` (`pip install requests`)
+
+**Optional dependencies (per file type):**
+- Video ingestion: `ffmpeg` (`sudo apt-get install ffmpeg`)
+- PDF ingestion: `pymupdf` (`pip install pymupdf`)
+- Thumbnail generation: `Pillow` (`pip install Pillow`)
+- COCO detection format: `pycocotools`, `Pillow`, `numpy` (`pip install pycocotools Pillow numpy`)
+- LeRobot frames format: `pandas`, `numpy` (`pip install pandas numpy`)
+
+**Required packages:**
+- WASM module built from C++ (see memory notes for build commands)
+
+**Optional dependencies (per file type):**
+- Video ingestion: `ffmpeg` (system binary)
+- PDF ingestion: `pdfjs-dist` (`npm install pdfjs-dist`)
+- Thumbnail generation: `sharp` (`npm install sharp`)
+- COCO detection format: no external deps (pure JS mask rendering)
+
 
 ## Architecture
 
