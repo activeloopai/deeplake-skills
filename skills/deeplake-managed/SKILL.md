@@ -1,6 +1,6 @@
 ---
 name: deeplake-managed
-description: SDK for ingesting data into Deeplake managed tables. Use when users want to store, ingest, or query data in Deeplake.
+description: SDK and CLI for ingesting data into Deeplake managed tables, and mounting a cloud-backed filesystem for persistent agent memory. Use when users want to store, ingest, query data in Deeplake, or set up persistent memory/filesystem.
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep, WebFetch
 metadata:
   openclaw:
@@ -16,6 +16,25 @@ metadata:
 > Agent-friendly SDK for ingesting data into Deeplake managed tables.
 > Use this skill when users want to store, ingest, or query data in Deeplake.
 > Available in both **Python** and **Node.js/TypeScript**.
+
+## DeepLake CLI (Filesystem Mode)
+
+For persistent agent memory as a mounted filesystem, use the **deeplake CLI**:
+
+```bash
+curl -fsSL https://deeplake.ai/install.sh | bash   # Install CLI
+deeplake init              # Interactive setup (auth + mount)
+deeplake mount             # Mount all registered filesystems
+deeplake umount --all      # Unmount all
+deeplake list              # Show mount status
+```
+
+After `deeplake init`, a FUSE-mounted directory appears at your chosen path (e.g. `~/agent-memory`).
+Files written there are cloud-synced to DeepLake in real-time and persist across sessions/reboots.
+
+**When to use CLI vs SDK:**
+- **CLI** — persistent filesystem for agent memory, config, and sandboxes (read/write files normally)
+- **SDK** — programmatic data ingestion, vector search, ML training pipelines
 
 ---
 
