@@ -1,14 +1,7 @@
 ---
-name: deeplake-managed
+name: deeplake
 description: SDK for ingesting data into Deeplake managed tables. Use when users want to store, ingest, or query data in Deeplake.
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep, WebFetch
-metadata:
-  openclaw:
-    requires:
-      env:
-        - DEEPLAKE_API_KEY
-    primaryEnv: DEEPLAKE_API_KEY
-    homepage: https://github.com/activeloopai/deeplake-skills
 ---
 
 # Deeplake Managed Service SDK
