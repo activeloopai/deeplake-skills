@@ -1,5 +1,5 @@
 ---
-name: deeplake-managed
+name: deeplake
 description: SDK and CLI for ingesting data into Deeplake managed tables, and mounting a cloud-backed filesystem for persistent agent memory. Use when users want to store, ingest, query data in Deeplake, or set up persistent memory/filesystem.
 allowed-tools: Bash, Read, Write, Edit, Glob, Grep, WebFetch
 metadata:

@@ -10,9 +10,9 @@ npx skills add activeloopai/deeplake-skills
 
 ## Available Skills
 
-| Skill                | Description                                                                                                                                         |
-| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **deeplake-managed** | SDK for ingesting data into Deeplake managed tables (Python & Node.js/TypeScript). Use when users want to store, ingest, or query data in Deeplake. |
+| Skill        | Description                                                                                                                                         |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **deeplake** | SDK for ingesting data into Deeplake managed tables (Python & Node.js/TypeScript). Use when users want to store, ingest, or query data in Deeplake. |
 
 ## Usage
 
@@ -29,7 +29,7 @@ Example prompts:
 
 ```
 skills/
-  deeplake-managed/
+  deeplake/
     SKILL.md        # Main agent instructions (Python + Node.js)
     reference.md    # pg_deeplake SQL reference (vector search, BM25, hybrid search)
     examples.md     # End-to-end workflow examples (Python + Node.js)
