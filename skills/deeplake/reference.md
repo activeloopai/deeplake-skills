@@ -352,16 +352,15 @@ print(client.query("SELECT * FROM smoke_test"))
 
 ## Setting the Credentials Key
 
-`deeplake_set_creds_key()` (pg_deeplake 1.5+) binds a table's LINK columns to a named
-managed credential. The key is resolved via the backend API **at read time** to fetch
-the linked external data.
+`deeplake_set_creds_key()` binds a table's LINK columns to a named managed credential
+so reads can dereference the external data the links point to. It does two things: it
+**resolves** the named credential to live storage credentials and injects them as the
+table's links reader for the current session, and it **persists** the key on the dataset
+so later opens re-resolve and re-inject automatically.
 
 ```sql
 -- deeplake_set_creds_key(tbl regclass, creds_key text, token text DEFAULT NULL)
 SELECT deeplake_set_creds_key('media'::regclass, 'prod-azure-bloblake');
-
--- optionally pass an explicit token (defaults to the session's)
-SELECT deeplake_set_creds_key('media'::regclass, 'prod-gcs-storage', '<token>');
 ```
 
 ```python
@@ -371,9 +370,22 @@ client.query("SELECT deeplake_set_creds_key($1::regclass, $2)", ("media", "prod-
 
 - `tbl` must be a DeepLake table (`USING deeplake`); calling it on a regular table
   errors with `not a DeepLake table`.
-- `creds_key` is the name of a credential configured in **Managed Credentials**.
-- Returns `void`. Without a valid creds key set, reads of LINK columns can't resolve the
-  underlying bytes (the `DLREF:` reference still returns, but the fetch fails).
+- `creds_key` is the name of a credential configured in **Managed Credentials** for the
+  org. If it isn't bound to the org (or the backend endpoint isn't reachable) the call
+  errors with `could not resolve creds_key '<key>'`.
+- Returns `void`. Once set, reads that materialize LINK bytes resolve through that
+  credential; without it the `DLREF:` reference still returns but the byte fetch fails.
+
+**Managed tables resolve the key without a user token.** pg_deeplake tables open by raw
+`s3://`/`az://`/`gs://` path and are *not* "connected to the Activeloop platform"
+(no `ds_name`), so the legacy token-based path would throw
+`not connected to Activeloop platform`. Instead the extension resolves the key from its
+own pg context — **database name = org, schema = workspace** — against an internal,
+service-authed backend endpoint, exchanges it for scoped storage credentials, and builds
+a self-refreshing reader (it re-exchanges through the same endpoint when temporary STS
+creds expire). The third `token` argument is **legacy and ignored** for managed tables;
+no session token is required. This resolution requires the extension's `DEEPLAKE_API_URL`
+to be configured (it is, in the managed deployment).
 
 ---
 
