@@ -176,6 +176,7 @@ LIMIT 10;
 | `POINT`        | list[float] | number[]          | DEEPLAKE_POINT (float4[]) | `[1.0, 2.0]`            |
 | `MESH`         | bytes       | Buffer/Uint8Array | MESH (bytea)              | 3D mesh data (PLY, STL) |
 | `MEDICAL`      | bytes       | Buffer/Uint8Array | MEDICAL (bytea)           | Medical imaging (DICOM) |
+| `LINK(target)` | bytes       | Buffer/Uint8Array | LINK (bytea)              | Reference to external data (see [LINK Types](#link-types-and-roundtrip)) |
 | `FILE`         | str (path)  | string (path)     | N/A (processed)           | `"/path/to/file.mp4"`   |
 
 > **Note:** `EMBEDDING` is a Deeplake schema type that maps to `float4[]` in PostgreSQL. pg_deeplake treats these columns specially for vector similarity search via the `<#>` operator and `deeplake_index`.
@@ -203,6 +204,188 @@ LIMIT 10;
 - `bytes` / `Buffer` -> BINARY
 - `str` / `string` -> TEXT
 - `list[float]` / `number[]` -> EMBEDDING (size auto-detected)
+
+---
+
+## LINK Types and Roundtrip
+
+`LINK` is a parameterized PostgreSQL domain over `bytea` that stores a **reference** to
+external data (in S3/GCS/Azure) instead of the bytes themselves. The data is fetched
+lazily at read time, with credentials resolved via the backend API
+(see [Setting the Credentials Key](#setting-the-credentials-key)).
+
+**Available since pg_deeplake 1.5.** Earlier versions (1.4) shipped a bare `LINK` domain only.
+
+### Targets
+
+`LINK(target)` declares what kind of data the reference points to. Valid targets:
+
+```
+IMAGE, VIDEO, FILE, SEGMENT_MASK, MEDICAL, AUDIO, MESH, BYTES
+```
+
+Bare `LINK` (no target) defaults to `BYTES` semantics. An unknown target (e.g.
+`LINK(UNKNOWN)`) is rejected at `CREATE TABLE` / `ALTER TABLE` time.
+
+> **Note:** `AUDIO` is valid **only** as a LINK target — there is no standalone `AUDIO`
+> domain type. The other targets mirror the inline domain types of the same name.
+
+```sql
+CREATE TABLE media (
+    id    INT,
+    photo LINK(IMAGE),
+    clip  LINK(VIDEO),
+    scan  LINK(MEDICAL),
+    raw   LINK            -- bare LINK == LINK(BYTES)
+) USING deeplake;
+
+-- Add a LINK column to an existing table
+ALTER TABLE media ADD COLUMN sound LINK(AUDIO);
+```
+
+### Roundtrip behavior
+
+LINK columns do **not** roundtrip as raw bytes. The write side and read side differ:
+
+| Operation | Behavior |
+|-----------|----------|
+| **Write** (`INSERT`/`UPDATE`) | Cast bytes to the domain: `'\xDEADBEEF'::LINK`. NULL is allowed. |
+| **Read** (`SELECT`) | Returns a serialized **data reference**, not the bytes: `DLREF:version\|column_id\|row_id` |
+| **NULL** | A NULL link reads back as NULL. |
+
+```sql
+INSERT INTO media (id, photo) VALUES (1, '\x89504E47...'::LINK);
+
+SELECT photo FROM media WHERE id = 1;
+-- => 'DLREF:3|7|1'   (NOT the image bytes)
+```
+
+The `DLREF:` value encodes `version | column_id | row_id`. SDKs detect the `DLREF:`
+prefix and fetch the underlying object directly from storage using the table's resolved
+credentials. Within a single row all LINK columns share the same `version` and `row_id`
+but each has a distinct `column_id`.
+
+### How other types roundtrip
+
+The `DLREF:` indirection is shared with the inline `VIDEO` domain. Other media types
+return their bytes inline:
+
+| Type | `SELECT` returns |
+|------|------------------|
+| `LINK(target)`, `VIDEO` | `DLREF:version\|column_id\|row_id` reference (SDK fetches bytes) |
+| `IMAGE` | Image bytes inline — **may be base64-encoded string** depending on backend serialization (decode if `isinstance(val, str)`) |
+| `SEGMENT_MASK`, `BINARY_MASK`, `MEDICAL`, `MESH`, `DEEPLAKE_POLYGON`, `BINARY` | Bytes inline |
+| `EMBEDDING`, `BOUNDING_BOX`, `DEEPLAKE_POINT` | `float4[]` array inline |
+| Scalars (`TEXT`, `INT*`, `FLOAT*`, `BOOL`, `CLASS_LABEL`) | Native value inline |
+
+---
+
+## Managed Credentials
+
+LINK columns and `al://` datasets read/write data in your own cloud bucket. Deeplake
+resolves access through **managed credentials** configured in the platform UI
+(**Workspace → Managed Credentials**) and applied per workspace (resolution order:
+workspace credential → org default → environment default). The setup is a UI wizard
+that alternates with a couple of cloud-CLI commands; full walkthroughs:
+
+- **Azure** — https://docs.deeplake.ai/latest/guide/azure/
+- **GCS** — https://docs.deeplake.ai/latest/guide/gcs/
+
+### Azure (federated, condensed)
+
+Base path format: `az://<storage_account>/<container>` (container must already exist).
+
+1. In the UI, **Add credential → Azure**, set name + base path. The wizard generates an
+   `<APP_ID>`.
+2. Install the service principal in your tenant — **save the output's `id` (object ID)**:
+   ```bash
+   az ad sp create --id <APP_ID>
+   ```
+3. Submit your tenant ID in the wizard (UUID format).
+4. Grant `Storage Blob Data Contributor` on the storage account scope:
+   ```bash
+   ACCOUNT_ID="$(az storage account show --name <ACCOUNT_NAME> --query id -o tsv)"
+   az role assignment create \
+     --assignee-object-id <SP_OBJECT_ID> \
+     --assignee-principal-type ServicePrincipal \
+     --role "Storage Blob Data Contributor" \
+     --scope "${ACCOUNT_ID}"
+   ```
+5. Submit storage details (subscription ID, resource group, account, container) and
+   **Verify access**. The credential moves to `verified`.
+
+### GCS (condensed)
+
+Base path format: `gs://<bucket>/<optional-prefix>`. Two paths:
+
+**Path A — Service Account Key** (fastest): create an SA, grant
+`roles/storage.objectAdmin` on the bucket, generate a JSON key, and paste it into the
+wizard.
+```bash
+gcloud iam service-accounts create deeplake-storage --display-name="Deeplake managed storage"
+gcloud storage buckets add-iam-policy-binding "gs://<BUCKET>" \
+  --member="serviceAccount:deeplake-storage@<PROJECT_ID>.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+gcloud iam service-accounts keys create deeplake-sa-key.json \
+  --iam-account="deeplake-storage@<PROJECT_ID>.iam.gserviceaccount.com"
+```
+
+**Path B — Workload Identity Federation** (production, no stored key): select
+**GCS Federated** in the wizard; Deeplake provisions a per-credential service account,
+then run the wizard's pre-filled binding:
+```bash
+gcloud storage buckets add-iam-policy-binding gs://<BUCKET> \
+  --member="serviceAccount:c-<id>@activeloop-saas-iam.iam.gserviceaccount.com" \
+  --role="roles/storage.objectAdmin"
+```
+
+**Verify any credential** by creating a smoke-test table — data lands under
+`<base_path>/<org_id>/<workspace_id>/<table>/`:
+```python
+client = deeplake.Client(token="<token>", workspace_id="default")
+client.query('CREATE TABLE "smoke_test" ("id" BIGINT, "name" TEXT) USING deeplake', timeout=60)
+client.query("INSERT INTO smoke_test VALUES (1, 'hello'), (2, 'world')", timeout=60)
+print(client.query("SELECT * FROM smoke_test"))
+```
+
+---
+
+## Setting the Credentials Key
+
+`deeplake_set_creds_key()` binds a table's LINK columns to a named managed credential
+so reads can dereference the external data the links point to. It does two things: it
+**resolves** the named credential to live storage credentials and injects them as the
+table's links reader for the current session, and it **persists** the key on the dataset
+so later opens re-resolve and re-inject automatically.
+
+```sql
+-- deeplake_set_creds_key(tbl regclass, creds_key text, token text DEFAULT NULL)
+SELECT deeplake_set_creds_key('media'::regclass, 'prod-azure-bloblake');
+```
+
+```python
+# via the SDK query interface
+client.query("SELECT deeplake_set_creds_key($1::regclass, $2)", ("media", "prod-azure-bloblake"))
+```
+
+- `tbl` must be a DeepLake table (`USING deeplake`); calling it on a regular table
+  errors with `not a DeepLake table`.
+- `creds_key` is the name of a credential configured in **Managed Credentials** for the
+  org. If it isn't bound to the org (or the backend endpoint isn't reachable) the call
+  errors with `could not resolve creds_key '<key>'`.
+- Returns `void`. Once set, reads that materialize LINK bytes resolve through that
+  credential; without it the `DLREF:` reference still returns but the byte fetch fails.
+
+**Managed tables resolve the key without a user token.** pg_deeplake tables open by raw
+`s3://`/`az://`/`gs://` path and are *not* "connected to the Activeloop platform"
+(no `ds_name`), so the legacy token-based path would throw
+`not connected to Activeloop platform`. Instead the extension resolves the key from its
+own pg context — **database name = org, schema = workspace** — against an internal,
+service-authed backend endpoint, exchanges it for scoped storage credentials, and builds
+a self-refreshing reader (it re-exchanges through the same endpoint when temporary STS
+creds expire). The third `token` argument is **legacy and ignored** for managed tables;
+no session token is required. This resolution requires the extension's `DEEPLAKE_API_URL`
+to be configured (it is, in the managed deployment).
 
 ---
 
