@@ -172,7 +172,7 @@ LIMIT 10;
 | `BINARY_MASK`  | bytes       | Buffer/Uint8Array | BINARY_MASK (bytea)       | Binary mask data        |
 | `BOUNDING_BOX` | list[float] | number[]          | BOUNDING_BOX (float4[])   | `[x, y, w, h]`          |
 | `CLASS_LABEL`  | int         | number            | CLASS_LABEL (int4)        | Label index             |
-| `POLYGON`      | bytes       | Buffer/Uint8Array | DEEPLAKE_POLYGON (bytea)  | Polygon coordinates     |
+| `POLYGON`      | list[ndarray] | number[][][]    | DEEPLAKE_POLYGON (float4[][][]) | Per-row list of polygons, shaped (P x N x 2|3) — matches `deeplake.types.Polygon()`. Changed from `bytea` in 1.12. |
 | `POINT`        | list[float] | number[]          | DEEPLAKE_POINT (float4[]) | `[1.0, 2.0]`            |
 | `MESH`         | bytes       | Buffer/Uint8Array | MESH (bytea)              | 3D mesh data (PLY, STL) |
 | `MEDICAL`      | bytes       | Buffer/Uint8Array | MEDICAL (bytea)           | Medical imaging (DICOM) |
@@ -274,9 +274,125 @@ return their bytes inline:
 |------|------------------|
 | `LINK(target)`, `VIDEO` | `DLREF:version\|column_id\|row_id` reference (SDK fetches bytes) |
 | `IMAGE` | Image bytes inline — **may be base64-encoded string** depending on backend serialization (decode if `isinstance(val, str)`) |
-| `SEGMENT_MASK`, `BINARY_MASK`, `MEDICAL`, `MESH`, `DEEPLAKE_POLYGON`, `BINARY` | Bytes inline |
+| `SEGMENT_MASK`, `BINARY_MASK`, `MEDICAL`, `MESH`, `BINARY` | Bytes inline |
+| `DEEPLAKE_POLYGON` | `float4[][][]` array inline — list of polygons, each (N x 2|3) |
 | `EMBEDDING`, `BOUNDING_BOX`, `DEEPLAKE_POINT` | `float4[]` array inline |
 | Scalars (`TEXT`, `INT*`, `FLOAT*`, `BOOL`, `CLASS_LABEL`) | Native value inline |
+
+---
+
+## Attach an Existing Dataset
+
+A pg_deeplake table can be pointed at an existing on-disk deeplake dataset
+created out-of-band by the SDK (`deeplake.create`). The pg table acts as a
+SQL view over the existing typed columns — **no data rewrite, no codec
+restriction**. Works for any dtype × compression combination the SDK
+supports (`SegmentMask(UInt8())`, `SegmentMask("uint16", sample_compression="lz4")`,
+`png`/`zlib`/`null`, etc.) because the SDK's decode pipeline runs first and
+pg receives the decoded bytes.
+
+### The two-step attach
+
+```sql
+-- 1. Register a pg table with the column types you want SQL to see.
+--    Use the matching domain per column: SEGMENT_MASK / BINARY_MASK /
+--    MEDICAL / MESH / DEEPLAKE_POLYGON / etc.
+CREATE TABLE my_attached (
+    smask      SEGMENT_MASK,
+    lz4_smask  SEGMENT_MASK,
+    zlib_smask SEGMENT_MASK,
+    png_smask  SEGMENT_MASK
+) USING deeplake;
+
+-- 2. Retarget the table to the existing dataset's directory on storage.
+--    physical_name is the *last segment* of the s3/gcs path; the rest
+--    (bucket/org_id/workspace) is derived from the pg session.
+SECURITY LABEL FOR deeplake ON TABLE my_attached
+  IS 'physical_name=levon_testing_type_withour_compression_1';
+
+-- 3. Read. pg returns the SDK-decoded sample bytes for every codec.
+SELECT smask, lz4_smask, zlib_smask, png_smask FROM my_attached;
+```
+
+The first read after the retarget triggers an internal fall-back-to-open
+that adopts the existing on-disk schema. The pg catalog still reports a
+single domain per column (e.g. all four columns above show
+`data_type=bytea / domain_name=segment_mask`) — codecs are an
+on-disk implementation detail, not a wire-format distinction.
+
+### What attaches cleanly today
+
+| Pg domain          | SDK source                                                       |
+|--------------------|------------------------------------------------------------------|
+| `SEGMENT_MASK`     | `SegmentMask(UInt8/UInt16, sample_compression=null/lz4/zlib/png)` |
+| `BINARY_MASK`      | `BinaryMask(sample_compression=null/lz4)` only                   |
+| `MEDICAL`          | `Medical()` (DICOM/NIfTI pass-through)                           |
+| `MESH`             | `Mesh()` (PLY/STL pass-through)                                  |
+| `DEEPLAKE_POLYGON` | `Polygon()`                                                       |
+
+For typed numeric columns (uint8/uint16 arrays the pg side declares as
+`BYTEA`-family domains), reads work; writes through pg still expect the
+BYTEA wire shape (raw bytes), so use the SDK for typed-array DML on the
+same dataset.
+
+### Limitations
+
+- **BinaryMask is null/lz4 only.** zlib/png are rejected at the SDK
+  layer (`InvalidBinaryMaskCompression`). If a client's "binary mask"
+  data is PNG-compressed, it was actually declared as `SegmentMask`.
+- **PNG channel limit.** PNG can't losslessly store 5-channel uint8
+  arrays. A `SegmentMask(UInt8(), sample_compression="png")` over
+  `(H, W, 5)` silently drops to `(H, W, 4)` on encode (PIL/PNG-format
+  limitation). pg returns the same 4-channel result the SDK gives it.
+- **BinaryMask reads back as `numpy.bool_`** through the SDK (not
+  uint8). The underlying byte buffer matches uint8 0/1, so `pg → bytes`
+  agrees with `SDK → arr.tobytes()`.
+
+### `deeplake_resync_table_pointer(tbl regclass)`
+
+Available in pg_deeplake 1.13+. Use after the underlying deeplake
+dataset is mutated out-of-band (SDK `deeplake.create` / `add_column` on
+the same path from a side process) and pg scans start failing with
+`schema drift on table … pg projects column index N but deeplake
+dataset has only M columns`. Evicts the cached per-backend snapshot so
+the next access re-opens the dataset at HEAD:
+
+```sql
+SELECT deeplake_resync_table_pointer('my_attached'::regclass);
+SELECT * FROM my_attached;   -- now sees the new HEAD
+```
+
+Refuses to evict when the table has unapplied DML — flush first via
+`SELECT deeplake_flush_table('my_attached'::regclass)`. Refuses on
+non-deeplake tables.
+
+### Via the managed API
+
+The `Client._create_table_via_api(...)` + `Client.query("SECURITY LABEL …")`
+pair from `deeplake.managed.Client` is the canonical way to drive this
+from Python for a fleet of client datasets:
+
+```python
+client = Client(token=TOKEN, api_url=API_URL,
+                workspace_id="default", org_id=ORG_ID)
+deeplake.client.endpoint = API_URL
+
+client._create_table_via_api(
+    table_name="my_attached",
+    dataset_path="",                # server-derived; retarget below
+    pg_schema={"smask": "SEGMENT_MASK", "lz4_smask": "SEGMENT_MASK", ...},
+)
+client.query("SECURITY LABEL FOR deeplake ON TABLE my_attached "
+             "IS 'physical_name=levon_testing_type_withour_compression_1'")
+rows = client.query("SELECT smask, lz4_smask, zlib_smask, png_smask "
+                    "FROM my_attached")
+```
+
+For migration scripts that loop over many existing client datasets, see
+the dedicated skill `pg-deeplake-attach-typed-datasets`, which has the
+full playbook (dataset listing → schema inspection → dtype-kind →
+pg-domain mapping → registration → retarget → verify) plus the canonical
+beta probe script.
 
 ---
 
@@ -288,8 +404,119 @@ resolves access through **managed credentials** configured in the platform UI
 workspace credential → org default → environment default). The setup is a UI wizard
 that alternates with a couple of cloud-CLI commands; full walkthroughs:
 
+- **AWS** — https://docs.deeplake.ai/latest/guide/aws/
 - **Azure** — https://docs.deeplake.ai/latest/guide/azure/
 - **GCS** — https://docs.deeplake.ai/latest/guide/gcs/
+
+### Supported credential types
+
+`storage_type` is the discriminator on the credential record; it picks which generator
+mints the temp creds returned to indra at read time. Pick the rightmost column when
+production / no-stored-secret is the goal.
+
+| `storage_type`     | Identity model                                                                                                          | Workload-identity / no-key? | When to use                                                                                |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------- | --------------------------- | ------------------------------------------------------------------------------------------ |
+| `s3`               | Long-term AWS access keys (or pre-issued STS triplet — passed through as-is).                                           | No                          | Fastest setup; paste keys.                                                                 |
+| `s3:role`          | Customer IAM role ARN; deeplake-api uses stored AWS keys to `AssumeRole` (with optional session policy scoping path).   | Partial (role-based)        | Cross-account access without sharing the customer's user keys; key rotation still needed.  |
+| `gcs`              | Service-account JSON key (full key in the credential record).                                                           | No                          | Fastest GCS setup; SA-key download → paste.                                                |
+| `gcs_federated`    | **GCS Workload Identity Federation.** Per-cred GCP SA auto-provisioned in Deeplake's project; customer grants it bucket access. | **Yes**                     | Recommended for production GCS — no stored secret.                                         |
+| `azure`            | Storage account + shared key.                                                                                           | No                          | Fastest Azure setup.                                                                       |
+| `azure_federated`  | **Azure WI / OIDC federation.** Multi-step (Graph app install in customer tenant → tenant ID → storage account → access probe). | **Yes**                     | Recommended for production Azure — no stored secret; uses customer's existing SP/MI.       |
+
+All six types resolve through the same `/internal/orgs/{org}/workspaces/{ws}/storage-creds`
+path when a pg pod fetches workspace creds — `GenerateInternal` dispatches to the
+matching generator (`gen_s3.go`, `gen_s3_role.go`, `gen_gcs.go`, `gen_gcs_federated.go`,
+`gen_azure_federated.go`), so federated credentials work end-to-end without any
+special-casing at the pod.
+
+### Workload identity (customer-side, condensed)
+
+Three of the six types above are **federation-based** — the customer never stores a
+long-term secret with Deeplake. Use them in production:
+
+| Type              | What customer creates                                                                | What Deeplake provisions / does                                                              |
+| ----------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `gcs_federated`   | An IAM binding on the bucket granting the Deeplake-provisioned SA `objectAdmin`.    | A per-credential GCP SA in our project; impersonates via WIF when minting creds.            |
+| `azure_federated` | Installs our Graph app in their tenant + grants the SP `Storage Blob Data Contributor`. | An AAD app registration with an OIDC federated credential; exchanges via tenant trust.       |
+| `s3:role`         | An IAM role with a trust policy listing Deeplake's role ARN.                         | (today) Stored AWS keys do the `AssumeRole`; true OIDC-federated `s3_federated` is a planned addition. |
+
+Full walkthroughs live in the per-cloud sections below.
+
+### AWS (condensed)
+
+Base path format: `s3://<bucket>/<optional-prefix>` (bucket must already
+exist). Three paths, in increasing production-readiness:
+
+**Path A — Long-term IAM user keys** (`s3` storage_type; fastest,
+dev-only): create an IAM user with bucket-scoped policy, generate an
+access key, and paste `access_key_id` + `secret_access_key` into the
+wizard. Optional `session_token` field for pre-issued STS triplets
+(rotate before the triplet expires).
+```bash
+aws iam create-user --user-name deeplake-storage
+aws iam put-user-policy --user-name deeplake-storage \
+  --policy-name deeplake-bucket-access \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::<BUCKET>", "arn:aws:s3:::<BUCKET>/*"]
+    }]
+  }'
+aws iam create-access-key --user-name deeplake-storage
+```
+
+**Path B — AssumeRole** (`s3:role`, production-recommended today, no
+long-term customer-account secret stored on Deeplake's side): create an
+IAM role in your account with a trust policy listing Deeplake's runtime
+role ARN, grant the role bucket-scoped permissions, and paste the role
+ARN into the wizard. Deeplake-api uses its own stored credentials to
+issue `sts:AssumeRole`; the resulting STS triplet is what the pg pods
+receive. The `external_id` field (standard confused-deputy mitigation
+for cross-account AssumeRole) is required.
+```bash
+# Trust policy — allow Deeplake's runtime role to assume yours.
+# The wizard pre-fills <DEEPLAKE_ACCOUNT_ID>, <DEEPLAKE_RUNTIME_ROLE>,
+# and the suggested <EXTERNAL_ID> so you copy-paste verbatim.
+cat > trust-policy.json <<'EOF'
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::<DEEPLAKE_ACCOUNT_ID>:role/<DEEPLAKE_RUNTIME_ROLE>" },
+    "Action": "sts:AssumeRole",
+    "Condition": { "StringEquals": { "sts:ExternalId": "<EXTERNAL_ID>" } }
+  }]
+}
+EOF
+aws iam create-role --role-name deeplake-customer-access \
+  --assume-role-policy-document file://trust-policy.json
+
+# Same bucket-scoped policy as Path A, but attached to the role.
+aws iam put-role-policy --role-name deeplake-customer-access \
+  --policy-name deeplake-bucket-access \
+  --policy-document file://bucket-policy.json
+```
+Optional session policy scoping in the wizard further restricts the
+minted STS triplet to a sub-prefix of the bucket; useful when the same
+role serves multiple Deeplake workspaces.
+
+**Path C — `s3_federated` (OIDC, planned)**: when shipped, the model
+will mirror `gcs_federated` / `azure_federated`: a true OIDC web
+identity trust between your role and Deeplake's per-credential OIDC
+issuer, with zero stored secrets on either side. Track readiness in the
+Managed Credentials UI; no action needed until it appears as a wizard
+option. Until then, `s3:role` is the no-stored-customer-secret path.
+
+**Verify any credential** by creating a smoke-test table — data lands
+under `<base_path>/<org_id>/<workspace_id>/<table>/`:
+```python
+client = deeplake.Client(token="<token>", workspace_id="default")
+client.query('CREATE TABLE "smoke_test" ("id" BIGINT, "name" TEXT) USING deeplake', timeout=60)
+client.query("INSERT INTO smoke_test VALUES (1, 'hello'), (2, 'world')", timeout=60)
+print(client.query("SELECT * FROM smoke_test"))
+```
 
 ### Azure (federated, condensed)
 
@@ -389,6 +616,170 @@ to be configured (it is, in the managed deployment).
 
 ---
 
+## Workload Identity Authentication
+
+Distinct from the *storage* federation in the [Supported credential types](#supported-credential-types)
+table — this section is about **authenticating to deeplake-api itself** with a
+cloud-signed OIDC token instead of a Deeplake API token. Three layers cooperate.
+
+### 1. Server-side default — `ACTIVELOOP_AUTH_PROVIDER`
+
+A pod (pg_deeplake, indra-backed services) picks its own auth-provider class at
+startup from this env var:
+
+| Value                      | indra provider             | Token source                                                                  |
+| -------------------------- | -------------------------- | ----------------------------------------------------------------------------- |
+| *(unset)* / `activeloop`   | `activeloop_auth_provider` | Pass through whichever bearer the caller supplied.                            |
+| `azure`                    | `azure_auth_provider`      | `ChainedTokenCredential` — `WorkloadIdentityCredential` first (`AZURE_FEDERATED_TOKEN_FILE`), then env, then MSI. |
+| `aws`                      | `aws_auth_provider`        | AWS SDK default chain — picks up IRSA, instance profile, env.                |
+| `gcp`                      | `gcp_auth_provider`        | GCP ADC / Workload Identity Federation.                                       |
+
+Used for every outbound call indra makes to deeplake-api (`storage_creds`,
+`get_dataset_credentials`, etc.). The Azure chain ordering is **intentional** — WI
+goes before `EnvironmentCredential` because the latter errors loudly without
+`AZURE_CLIENT_SECRET`; don't reorder it.
+
+### 2. Org admin — register the workload identity
+
+Once registered, the workload's OIDC token authenticates it *as* a member of the
+org (no API token needed). Today: Azure SPs; AWS / GCP reserved.
+
+```
+POST   /organizations/{org_id}/workload-identities          (admin)  → 201
+GET    /organizations/{org_id}/workload-identities          (member) → 200
+GET    /organizations/{org_id}/workload-identities/{id}     (member) → 200
+DELETE /organizations/{org_id}/workload-identities/{id}     (admin)  → 204
+```
+
+Register body:
+```json
+{
+  "name": "prod-aks-cluster",
+  "workload_identity_data": {
+    "type": "azure",
+    "azure_client_id": "<uuid>",
+    "azure_tenant_id": "<uuid>"
+  }
+}
+```
+
+The middleware on every endpoint detects Azure-issued tokens by `iss`, verifies
+signature against the issuer's JWKS, looks up the WI by `(appid, tid)`, and binds
+the request to the registered identity's org. Registered WIs are also granted the
+FGA `member` relation on the org so existing authz checks pass.
+
+**The same Azure SP can be registered in more than one org** — uniqueness is
+scoped per `(org_id, azure_client_id, azure_tenant_id)`, not global. When that
+happens the auth middleware needs help picking which org to bind the request
+to: the client sends `X-Activeloop-Org-Id: <uuid>` alongside the Azure token,
+and the lookup matches the exact 3-tuple. When the header is absent and the SP
+is registered in exactly one org, the unique row is returned automatically. When
+the header is absent and >1 orgs claim it, the request fails:
+
+```
+HTTP 401
+workload identity matches multiple orgs; X-Activeloop-Org-Id required
+```
+
+Same SP registered in the *same* org twice is still a `409 CONFLICT` — the
+per-org unique index catches it.
+
+#### SDK contract: when is `org_id` required?
+
+To keep this from showing up as a runtime regression the day a customer
+registers their SP in a second org, the Python managed `Client` /
+`AsyncClient` requires `org_id` **at construction time** whenever
+`auth_provider` is set to a workload-identity value. The split:
+
+| `auth_provider`              | `org_id` source                                          | What happens if missing                |
+| ---------------------------- | -------------------------------------------------------- | -------------------------------------- |
+| default (API token)          | extracted from JWT `org` claim                           | nothing — works as before              |
+| `azure` / `gcp` / `aws` (WI) | **`org_id=` kwarg** OR `ACTIVELOOP_ORG_ID` env var       | `AuthError` raised by `Client.__init__` |
+
+```python
+# WI mode — org_id required, either as kwarg…
+c = deeplake.Client(auth_provider='azure', org_id='b7f45e10-…')
+
+# …or via env (handy for shell-level multi-org switching)
+# export ACTIVELOOP_ORG_ID=b7f45e10-…
+c = deeplake.Client(auth_provider='azure')
+
+# Missing both → AuthError("org_id required when auth_provider='azure'. …")
+c = deeplake.Client(auth_provider='azure')  # AuthError
+```
+
+The Node/TypeScript `ManagedClient` (`typescript/node/src/client.ts`) enforces
+the same contract:
+
+```ts
+// WI mode — orgId required, either as option…
+const c = new ManagedClient({
+  token: azureWiToken,
+  authProvider: 'azure',
+  orgId: 'b7f45e10-…',
+});
+
+// …or via env
+// process.env.ACTIVELOOP_ORG_ID = 'b7f45e10-…';
+const c = new ManagedClient({ token: azureWiToken, authProvider: 'azure' });
+
+// Missing both → AuthError on construction.
+```
+
+The resolved value is sent two ways:
+1. As `X-Activeloop-Org-Id` on every Python/JS HTTP call (handled in Python's
+   `_api_request` and JS's `apiRequest`).
+2. Pushed into the `ACTIVELOOP_ORG_ID` (and `ACTIVELOOP_AUTH_PROVIDER`)
+   process env around `deeplake.open(...)` / `deeplake.open_async(...)` /
+   `deeplakeSetEndpointAndOpen(...)` via `_push_org_id_env()` (Python) /
+   `_withProviderEnv()` (Node) so the C++ HTTP layer
+   (`cpp/backend/client.cpp` `get_dataset_credentials`) sends the same
+   header on its outbound `/api/org/{ws}/ds/{ds}/creds` request. Without
+   that bridge, the al:// path only carries the workspace name and the
+   server can't disambiguate.
+
+   Browser (no-Node) builds of the JS SDK skip the env-var push because
+   `process.env` isn't available — they rely on the WASM client picking up
+   any disambiguator from the JS-issued HTTP header path instead.
+
+### 3. Client-side hint — `authProvider` / `X-Activeloop-Auth-Provider`
+
+The SDK signals "this token isn't an API token, route it through provider X" so
+the server can pick the matching auth path **per request** without changing the
+pod's env. Resolution: explicit option → client-machine env var → none.
+
+```python
+# Python — explicit, or fall back to ACTIVELOOP_AUTH_PROVIDER env on the client.
+client = DeepLakeBackendClient(token=azure_wi_token, auth_provider="azure")
+```
+
+```ts
+// Node — same; browser builds skip the env fallback.
+const client = new ManagedClient({
+  token: azureWiToken,
+  authProvider: "azure",
+});
+```
+
+On every outbound request the SDK stamps:
+```
+X-Activeloop-Auth-Provider: azure
+```
+deeplake-api's `ExecuteQuery` handler reads the header and applies it to the
+pg connection via `SELECT set_config('deeplake.auth_provider', 'azure', false)`
+just before running the user's query (and resets in a deferred block so the
+pooled conn doesn't leak the setting). pg_deeplake's `assign_hook` on that GUC
+mirrors the value into indra's `auth_provider_type_override_slot` — a
+thread-local override read by `backend::client`'s outbound calls for the
+duration of the query, with `auth_provider_type_from_env()` as the fallback
+when no hint arrives.
+
+Net effect: pod startup is unchanged; the user's WI token routes through the
+matching provider end-to-end. Empty/absent hint → server uses the pod's
+`ACTIVELOOP_AUTH_PROVIDER` default.
+
+---
+
 ## Thumbnail Table Schema
 
 When a format declares `image_columns()`, the SDK auto-generates a shared `thumbnails` dataset at `{root_path}/thumbnails` with this schema:
@@ -456,6 +847,29 @@ A final `ds.commit()` is always called after all rows are written.
 ---
 
 ## Troubleshooting
+
+**"Dataset already exists at path" on CREATE TABLE:**
+Pre-pg_deeplake 1.13 this surfaced when a deeplake dataset already lived
+on storage but no pg catalog row pointed at it (SDK-created dataset, a
+retried CREATE, or a cross-pod race). Fixed in 1.13 — CREATE TABLE now
+attaches to the existing deeplog via fall-back-to-open. Upgrade to 1.13+
+if you see this on a fresh CREATE TABLE.
+
+**"schema drift on table … pg projects column index N but deeplake dataset has only M columns":**
+The on-disk deeplake schema changed under pg (SDK `deeplake.create` /
+`add_column` from a side process) and this backend's cached snapshot is
+stale.
+```sql
+SELECT deeplake_flush_table('my_table'::regclass);          -- if DML pending
+SELECT deeplake_resync_table_pointer('my_table'::regclass); -- evict snapshot
+SELECT * FROM my_table;                                     -- sees new HEAD
+```
+See [Attach an Existing Dataset](#attach-an-existing-dataset).
+
+**"Expected vector of type UINT8, but found vector of type VARCHAR" on SELECT:**
+Reading a typed-column SDK dataset through a BYTEA-domain pg table on a
+pg_deeplake older than 1.13. The typed-bytea fill path (1.13+) emits the
+SDK-decoded sample bytes through the BYTEA wire. Upgrade.
 
 **"Token required" error:**
 ```bash

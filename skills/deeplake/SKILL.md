@@ -780,6 +780,6 @@ Operation failed with error
 
 ## Supporting Files
 
-- **[reference.md](reference.md)** -- pg_deeplake SQL reference (vector search, BM25, hybrid search, indexes), data types, LINK types & roundtrip, managed credentials (Azure/GCS) & `deeplake_set_creds_key()`, limits, performance tuning, troubleshooting
+- **[reference.md](reference.md)** -- pg_deeplake SQL reference (vector search, BM25, hybrid search, indexes), data types, LINK types & roundtrip, **attaching an existing SDK dataset (SECURITY LABEL physical_name + `deeplake_resync_table_pointer`)**, managed credentials (Azure/GCS) & `deeplake_set_creds_key()`, limits, performance tuning, troubleshooting
 - **[examples.md](examples.md)** -- Complete end-to-end workflow examples and detailed ingestion examples
 - **[formats.md](formats.md)** -- Format base class, custom format classes, normalize()/schema()/image_columns() rules
