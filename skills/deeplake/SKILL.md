@@ -202,8 +202,22 @@ client = Client(
     token: str = None,           # API token (falls back to DEEPLAKE_API_KEY env var)
     workspace_id: str = "default",  # Target workspace (default: "default")
     api_url: str = None,         # API URL (default: https://api.deeplake.ai)
+    org_id: str = None,          # Target org UUID. REQUIRED when the token's embedded
+                                 #   org differs from the org you want to act in (see below).
 )
 ```
+
+> **Cross-org calls — `org_id=` is easy to miss.** An API token embeds a **single**
+> `org_id` claim, even for a user who belongs to many orgs. Every request the SDK
+> makes is scoped to an org; if you omit `org_id`, that scope silently defaults to
+> the **token's** embedded org — not necessarily the one you intended. Whenever the
+> token-org ≠ the target-org, pass `org_id=` (Python/JS kwarg) or set
+> `ACTIVELOOP_ORG_ID`; the SDK forwards it as the `X-Activeloop-Org-Id` HTTP header.
+> The server only honors that exact header — other org-ish header names
+> (e.g. `X-Org-Id`) are ignored, so a wrong/missing value creates resources in the
+> token's org **with no error**. Map an org **name → UUID** via `GET /me` (returns
+> the org IDs your token can reach). See [reference.md](reference.md) for the full
+> auth-provider / `org_id` contract.
 
 ### Node.js / TypeScript
 
@@ -281,6 +295,17 @@ const result = await client.ingest(
 
 **Returns:** `{"table_name": "videos", "row_count": 150, "dataset_path": "al://workspace_id/videos"}`
 
+> **⚠️ Always check `row_count` against what you sent.** `ingest()` returning
+> without raising is **not** proof the rows committed. During backend
+> credential-refresh / provisioning windows a batch can be accepted at the HTTP
+> layer yet land zero rows, and older servers reported `row_count: 0` for a write
+> even when it succeeded. Treat `row_count` as the source of truth: if it doesn't
+> equal `len(data)`, retry the missing rows (ingest is **append**, so use a
+> deterministic primary key + de-dupe, or `INSERT … ON CONFLICT DO NOTHING`, to
+> stay idempotent). After a large ingest, confirm with
+> `SELECT COUNT(*) FROM <table>` — but mind the visibility lag (see
+> [Querying → read-your-writes](#querying)).
+
 **Both `data` and `format`:** If both are provided, `format` takes precedence and `data` is ignored. If neither is provided, an `IngestError` is raised.
 
 **Thumbnails:** When a format object declares `image_columns()` (columns with pg_schema type `"IMAGE"`), thumbnails are auto-generated at 4 sizes (32x32, 64x64, 128x128, 256x256) and stored in a shared `thumbnails` dataset at `{root_path}/thumbnails`. Requires Pillow (Python) or sharp (Node.js).
@@ -312,6 +337,11 @@ client.ingest("vectors", {
 # Ingest with explicit schema
 client.ingest("data", {"name": ["Alice", "Bob"], "age": [30, 25]},
               schema={"name": "TEXT", "age": "INT64"})
+
+# JSONB is a supported schema type — store arbitrary nested JSON per row.
+# (Not obvious from the type table; confirmed working end-to-end.)
+client.ingest("events", {"id": [1, 2], "payload": [{"k": "v"}, {"n": [1, 2]}]},
+              schema={"id": "INT64", "payload": "JSONB"})
 
 # Ingest from HuggingFace
 client.ingest("mnist", {"_huggingface": "mnist"})
@@ -439,6 +469,47 @@ Queries are sent to the API via `POST /workspaces/{id}/tables/query`. Use `$1`, 
 
 > For pg_deeplake SQL features (vector search, BM25, hybrid search, indexes), see [reference.md](reference.md).
 
+### Read-your-writes: the ingest → query visibility lag
+
+A successful `ingest()` / `INSERT` is **not immediately visible** to a following
+read. Writes flush to object storage asynchronously, so a `COUNT(*)` issued
+milliseconds after a commit can return the *old* count (often 0 on a fresh
+table) — this is a **timing lag, not data loss**. When chaining an ingest into a
+query, either:
+
+- poll `SELECT COUNT(*) FROM <table>` until it reaches the expected count (allow
+  a few seconds — empirically ~5s), or
+- if a side process mutated the same dataset path out-of-band and reads then
+  fail with `schema drift` / stale results, evict the cached snapshot:
+
+```sql
+SELECT deeplake_resync_table_pointer('my_table'::regclass);  -- re-open at HEAD
+SELECT COUNT(*) FROM my_table;                                -- now current
+```
+
+`deeplake_resync_table_pointer` (pg_deeplake 1.13+) refuses to run with unflushed
+DML — call `deeplake_flush_table('my_table'::regclass)` first. See
+[reference.md](reference.md#deeplake_resync_table_pointertbl-regclass).
+
+### SQL dialect — Postgres wire, DuckDB execution
+
+Queries against deeplake tables are parsed as PostgreSQL but **executed by a
+DuckDB engine** underneath, so the two dialects don't fully overlap and the split
+occasionally leaks into error messages:
+
+- **`jsonb` functions:** DuckDB exposes `json_*`, not the PG `jsonb_*` aliases.
+  `jsonb_array_length(col)` fails ("did you mean json_array_length"); even
+  `json_array_length(jsonb_col)` can fail. The reliable form is
+  `json_array_length(col::json)`. Prefer `json_*` names and cast `jsonb` → `json`.
+- **JSON access operators:** the PG `->` / `->>'key'` operators work, but under
+  the hood they map to DuckDB path syntax (`'$.key'`) — which is what you'll see
+  echoed in errors. Extracting with `json_extract(col, '$.key')` avoids surprises.
+- **DDL limits:** in-place column type migration is **not** supported —
+  `ALTER TABLE … ALTER COLUMN … TYPE …` fails with
+  "VACUUM FULL is not supported for deeplake tables". To change a column type,
+  create a new table with the target schema and copy the data
+  (`INSERT INTO new SELECT … FROM old`).
+
 ---
 
 ## Table Management
@@ -497,11 +568,23 @@ Workspaces are created via the REST API. The SDK clients don't have a built-in `
 
 **Important:** The `id` field is **required** when creating a workspace. Omitting it returns an error.
 
+> **⚠️ Which org does the workspace land in?** `POST /workspaces` creates the
+> workspace in the org the request is **scoped** to. That scope comes from the
+> `X-Activeloop-Org-Id` header — and **only** that header. If you belong to
+> multiple orgs and pass no org header (or a mistyped one like `X-Org-Id`), the
+> workspace is silently created in the **token's embedded org**, not the one you
+> meant — with **no error**. Always set `X-Activeloop-Org-Id: <target-org-uuid>`
+> (or construct the client with `org_id=`, which adds it for you) when the target
+> org differs from the token's org. Verify afterward with
+> `GET /workspaces` (the `org_id` field on each row) before ingesting.
+
 ```typescript
 // Node.js — create workspace via API
 import { apiRequest, extractOrgId } from 'deeplake';
 
-const orgId = extractOrgId(token);
+// extractOrgId reads the token's embedded org. Pass a DIFFERENT org UUID here to
+// target another org — apiRequest sends it as X-Activeloop-Org-Id.
+const orgId = targetOrgId ?? extractOrgId(token);
 await apiRequest(apiUrl, token, orgId, {
     method: 'POST',
     path: '/workspaces',
@@ -581,6 +664,52 @@ import {
 | `WorkspaceError: No storage path`          | API returned no path      | Check workspace exists and has storage configured           |
 
 > For troubleshooting details, see [reference.md](reference.md).
+
+---
+
+## Reliability & Retries
+
+The managed backend is a shared, autoscaling pool. Individual pods restart,
+scale up under load, and refresh storage credentials — so **transient errors are
+normal** and a robust client must retry them. Build these behaviors into any
+bulk copy / ETL loop.
+
+### Retry transient HTTP statuses (with backoff)
+
+| Status | Meaning | Client action |
+| ------ | ------- | ------------- |
+| **503** (often with `Retry-After`) | Backend scaling / under load / connect failure — the query never ran | Honor `Retry-After` (default ~2s); retry with exponential backoff |
+| **504** | Query exceeded its deadline | Retry, or raise `timeout` / add a `LIMIT` |
+| **429** | Rate limited | Honor `Retry-After` |
+| **502 / 500** on a query | Should be rare; treat as transient and retry a bounded number of times | Retry with backoff; alert if it persists |
+
+Reads are always safe to retry. For **writes**, retry only if the write is
+idempotent (deterministic primary key + `ON CONFLICT DO NOTHING`, or a de-dupe
+pass) — a 503 means the write didn't run, but a dropped connection *after* the
+server committed is ambiguous, so idempotency is the safe default.
+
+### ⚠️ Silent truncation: an empty page is NOT always end-of-data
+
+The single most dangerous failure mode for a **paginating** client
+(`LIMIT/OFFSET` or keyset loops): during a backend credential-refresh window a
+page can come back **HTTP 200 with zero rows** even though more data exists. A
+naive loop that treats "empty page ⇒ done" will **silently truncate** — e.g.
+stop at 137k of 249k rows and report success. Guard against it:
+
+- **Don't infer completion from a single empty page.** Cross-check the total
+  first (`SELECT COUNT(*)`) and keep paging until you've read that many rows.
+- Prefer **keyset pagination** (`WHERE id > $last ORDER BY id LIMIT n`) over
+  `OFFSET`, and verify the last key advances.
+- If a page is unexpectedly empty mid-stream, **re-request it** after a short
+  backoff before concluding you're done — a genuine end-of-data page stays empty;
+  a credential-refresh blip fills in on retry.
+- After the copy, assert `rows_copied == COUNT(*)` and fail loudly on a mismatch.
+
+### After ingest, verify the committed count
+
+See [Ingestion](#ingestion) — `ingest()` returning is not proof of a commit.
+Compare the returned `row_count` to what you sent, and reconcile a bulk load with
+a final `COUNT(*)` (accounting for the visibility lag above).
 
 ---
 
