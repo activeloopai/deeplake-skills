@@ -164,6 +164,7 @@ LIMIT 10;
 | `FLOAT32`      | float       | number            | real                      | `3.14`                  |
 | `FLOAT64`      | float       | number            | double precision          | `3.14159265359`         |
 | `BOOL`         | bool        | boolean           | boolean                   | `True`                  |
+| `JSONB`        | dict/list   | object/array      | jsonb                     | `{"k": "v"}`            |
 | `BINARY`       | bytes       | Buffer/Uint8Array | bytea                     | `b"\x00\x01"`           |
 | `IMAGE`        | bytes       | Buffer/Uint8Array | IMAGE (bytea)             | Image binary data       |
 | `VIDEO`        | bytes       | Buffer/Uint8Array | bytea                     | Video binary data       |
@@ -204,6 +205,30 @@ LIMIT 10;
 - `bytes` / `Buffer` -> BINARY
 - `str` / `string` -> TEXT
 - `list[float]` / `number[]` -> EMBEDDING (size auto-detected)
+
+> **`JSONB` columns:** pass `schema={"col": "JSONB"}` explicitly (dict/list values
+> are not inferred as `jsonb`). Querying is subject to the DuckDB dialect split —
+> use `json_*` functions, not the PG `jsonb_*` aliases, and cast when needed:
+> `json_array_length(col::json)`. See [SQL Dialect](#sql-dialect-postgres-wire-duckdb-execution).
+
+---
+
+## SQL Dialect: Postgres wire, DuckDB execution
+
+Queries against deeplake (pg_deeplake) tables are **parsed as PostgreSQL but
+executed by a DuckDB engine**. Most SQL is identical, but where the dialects
+diverge the DuckDB layer shows through — sometimes in error text that names
+DuckDB constructs. Known caveats:
+
+| Area | PG form that fails | Use instead |
+| ---- | ------------------ | ----------- |
+| JSON length | `jsonb_array_length(col)` → *"did you mean json_array_length"* | `json_array_length(col::json)` |
+| JSON aliases | `jsonb_*` family generally | `json_*` family (cast `jsonb`→`json`) |
+| JSON access | `col->>'key'` works, but errors echo DuckDB `'$.key'` path syntax | `json_extract(col, '$.key')` for clarity |
+| Column type change | `ALTER TABLE … ALTER COLUMN … TYPE …` → *"VACUUM FULL is not supported for deeplake tables"* | Create a new table with the target schema and `INSERT … SELECT` to copy |
+
+**Rule of thumb:** advertise/write **`json_*`** (DuckDB-native) rather than
+`jsonb_*`, and cast `jsonb` values to `json` before applying JSON functions.
 
 ---
 
