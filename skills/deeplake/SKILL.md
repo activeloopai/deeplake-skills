@@ -83,16 +83,29 @@ results = client.table("videos").select("id", "text").where("file_id = $1", "abc
 # Raw SQL
 results = client.query("SELECT * FROM videos LIMIT 10")
 
-# Vector similarity search
-results = client.query("""
-    SELECT id, text, embedding <#> $1 AS similarity
+# Vector similarity search -- through client.query() the vector must be
+# INLINED, not passed as $1 (see "Querying" below for why)
+from deeplake.managed import vector_literal
+results = client.query(f"""
+    SELECT id, text, embedding::float4[] <#> {vector_literal(query_embedding)} AS similarity
     FROM embeddings ORDER BY similarity DESC LIMIT 10
-""", (query_embedding,))
+""")
+
+# Create an empty table with an explicit schema (no data yet)
+client.create_table("docs", {
+    "id": "TEXT",
+    "embedding": "EMBEDDING(1536)",     # NOT bare "EMBEDDING" — keep the dimension
+}, index={"id": "inverted_index", "embedding": "clustered"})
 
 # Table management
 client.list_tables()
 client.drop_table("old_table")
-client.create_index("embeddings", "embedding")
+client.create_index("embeddings", "embedding", index_type="clustered")
+client.drop_index("embeddings", "embedding")
+client.describe_table("embeddings")     # {col: {"type": ..., "index": ...}}
+
+# Open a table without taking write access
+ds = client.open_table("embeddings", read_only=True)
 ```
 
 ### Node.js / TypeScript
@@ -139,10 +152,21 @@ const results = await client.table("videos")
 // Raw SQL
 const rows = await client.query("SELECT * FROM videos LIMIT 10");
 
+// Create an empty table with an explicit schema (no data yet)
+await client.createTable("docs", {
+    id: "TEXT",
+    embedding: "EMBEDDING(1536)",       // NOT bare "EMBEDDING" — keep the dimension
+}, { index: { id: "inverted_index", embedding: "clustered" } });
+
 // Table management
 await client.listTables();
 await client.dropTable("old_table");
-await client.createIndex("embeddings", "embedding");
+await client.createIndex("embeddings", "embedding", { indexType: "clustered" });
+await client.dropIndex("embeddings", "embedding");
+await client.describeTable("embeddings");   // {col: {type, index}}
+
+// Open a table without taking write access
+const ds = await client.openTable("embeddings", true);
 ```
 
 ---
@@ -172,10 +196,13 @@ Python:  Client(token, workspace_id)
 Node.js: ManagedClient({ token, workspaceId })
   |-- .ingest(table, data)       -> creates PG table via API, opens al://{ws}/{table}
   |                                 via deeplake SDK (auto credential rotation)
+  |-- .create_table(table, schema) -> POST /workspaces/{id}/tables (empty table, no rows)
   |-- .query(sql)                -> POST /workspaces/{id}/tables/query -> list[dict] / QueryRow[]
   |-- .table(table)...           -> fluent SQL builder -> list[dict] / QueryRow[]
-  |-- .create_index(table, col)  -> CREATE INDEX USING deeplake_index (for search)
-  |-- .open_table(table)         -> deeplake.open("al://{ws}/{table}") with auto creds
+  |-- .create_index(table, col, index_type=) -> CREATE INDEX USING deeplake_index
+  |-- .drop_index(table, col)    -> DROP INDEX (needed to change a column's index type)
+  |-- .describe_table(table)     -> {col: {type, index}} read back from storage
+  |-- .open_table(table, read_only=) -> deeplake.open[_read_only]("al://{ws}/{table}")
   |-- .list_tables()             -> GET /workspaces/{id}/tables -> list[str] / string[]
   `-- .drop_table(table)         -> DELETE /workspaces/{id}/tables/{name}
                     |
@@ -184,7 +211,7 @@ Node.js: ManagedClient({ token, workspaceId })
   - All DB operations go through the REST API (no direct PG connection)
   - Dataset access uses al:// paths with automatic credential resolution
   - Creds endpoint: GET /api/org/{workspace}/ds/{table}/creds
-  - Vector similarity: embedding <#> query_vec
+  - Vector similarity: embedding::float4[] <#> query_vec
   - BM25 text search:  text <#> 'search query'
   - Hybrid search:     (embedding, text)::deeplake_hybrid_record
 ```
@@ -367,26 +394,52 @@ client.ingest("docs", {"path": pdf_files}, schema={"path": "FILE"}, on_progress=
 Open a managed table as a `deeplake.Dataset` for direct access -- bypasses PostgreSQL and returns the native dataset object with built-in ML framework integration.
 
 ```python
-ds = client.open_table(table_name: str) -> deeplake.Dataset
+ds = client.open_table(table_name: str, read_only: bool = False) -> deeplake.Dataset
+```
+
+```typescript
+const ds = await client.openTable(tableName: string, readOnly?: boolean);
 ```
 
 **When to use:** Training loops, batch iteration, PyTorch/TensorFlow DataLoaders, async prefetch.
 
+> **Pass `read_only=True` for anything that only reads.** The default opens
+> **read/write**, which takes a writer handle on the dataset and leaves a stray
+> `append` / `commit` free to mutate a table you only meant to inspect. With
+> `read_only=True` you get a `ReadOnlyDataset` whose mutating methods raise.
+> Reading, querying, `summary()`, batch iteration and dataloaders all work
+> unchanged.
+
 ```python
-# Batch iteration
-ds = client.open_table("videos")
+# Inspect without taking write access
+ds = client.open_table("videos", read_only=True)
+ds.summary()
+
+# Batch iteration (training reads only — open read-only)
+ds = client.open_table("videos", read_only=True)
 for batch in ds.batches(32):
     train(batch)
 
 # PyTorch DataLoader
 from torch.utils.data import DataLoader
-ds = client.open_table("training_data")
+ds = client.open_table("training_data", read_only=True)
 loader = DataLoader(ds.pytorch(), batch_size=32, shuffle=True, num_workers=4)
 
 # TensorFlow tf.data.Dataset
-ds = client.open_table("training_data")
+ds = client.open_table("training_data", read_only=True)
 tf_ds = ds.tensorflow().batch(32).prefetch(tf.data.AUTOTUNE)
+
+# Writing still needs the default read/write handle
+ds = client.open_table("training_data")
+ds.append({"id": ["x"]})
+ds.commit()
 ```
+
+> **Node.js note:** `openTable(name, true)` needs a WASM build carrying the
+> `deeplake_open_read_only` binding, and `describeTable()` needs one carrying
+> `Dataset.summary()`. Older bundles raise a clear error naming the missing
+> binding; rebuild the WASM module (`python3 scripts/build_wasm_node.py dev`),
+> or on the Python side, where both have shipped for longer.
 
 ---
 
@@ -518,47 +571,214 @@ occasionally leaks into error messages:
 # Python
 tables = client.list_tables() -> list[str]
 client.drop_table(table_name: str, if_exists: bool = True) -> None
-client.create_index(table_name: str, column: str) -> None
+client.create_table(table_name: str, schema: dict, *,
+                    index=None, if_not_exists: bool = True) -> dict
+client.create_index(table_name: str, column: str, *,
+                    index_type: str = None, dimension: int = None) -> None
+client.drop_index(table_name: str, column: str, if_exists: bool = True) -> None
+client.describe_table(table_name: str) -> dict
 ```
 
 ```typescript
 // Node.js
 const tables = await client.listTables();
 await client.dropTable(tableName: string, ifExists?: boolean); // default true
-await client.createIndex(tableName: string, column: string);
+await client.createTable(tableName: string, schema: SchemaMap,
+                         options?: { index?: IndexSpec, ifNotExists?: boolean });
+await client.createIndex(tableName: string, column: string,
+                         options?: { indexType?: string, dimension?: number });
+await client.dropIndex(tableName: string, column: string, ifExists?: boolean);
+await client.describeTable(tableName: string);
 ```
+
+### Creating a Table
+
+`ingest()` creates a table as a side effect of writing rows. `create_table()` /
+`createTable()` creates an **empty** one with an explicit schema. Use it when the
+table must exist before any data lands: building a skeleton that mirrors an
+existing dataset, provisioning a target for `INSERT INTO … SELECT`, or
+pre-declaring domain types that inference can't guess from values.
+
+```python
+result = client.create_table("docs", {
+    "id": "TEXT",
+    "chunk_id": "TEXT",
+    "created_at": "INT64",
+    "embedding": "EMBEDDING(1536)",
+}, index={
+    "id": "inverted_index",
+    "chunk_id": "inverted_index",
+    "embedding": "clustered",
+})
+# {"table_name": "docs", "created": True, "dataset_path": "al://ws/docs"}
+```
+
+> **⚠️ Write `EMBEDDING(dim)`, not bare `EMBEDDING`.** Bare `EMBEDDING` maps to
+> an unparameterized `float4[]`, which pg_deeplake stores as a *variable-length*
+> float array — not an `embedding(dim, float32)` column. On an empty skeleton
+> there are no rows to infer a dimension from, so a later `create_index` has
+> nothing to work with (you'd have to pass `dimension=` by hand). With
+> `EMBEDDING(1536)` the column comes back as `embedding(1536, clustered)`,
+> matching a real vector dataset.
+>
+> Any type name the map doesn't recognise is now passed through to PostgreSQL
+> verbatim, so `SMALLINT`, `TEXT[]`, or `LINK(IMAGE)` all work — and a typo
+> surfaces as a server error instead of silently becoming a `TEXT` column.
+
+> **`EMBEDDING(N)` already carries a `clustered` index.** Declaring the column
+> is enough — `describe_table` reports `embedding(N, clustered)` with
+> `index=clustered` before you call `create_index` at all. Passing
+> `index={"col": "clustered"}` is therefore redundant (harmless — same type, so
+> it's a no-op), but requesting a **different** type on such a column fails:
+>
+> ```
+> Conflicting index types for column 'emb': existing index type 'clustered'
+> ```
+>
+> To build a `clustered_quantized` index, declare the column as bare
+> `"EMBEDDING"` (a plain `float4[]`, which carries no index) and pass the
+> dimension at index time:
+>
+> ```python
+> client.create_table("vecs", {"emb": "EMBEDDING"})
+> client.create_index("vecs", "emb",
+>                     index_type="clustered_quantized", dimension=1536)
+> ```
+
+`create_table` returns `created=False` when the table already exists (pass
+`if_not_exists=False` to make that an error instead). Unlike `ingest`, an index
+failure here **raises** — there is no committed data to protect.
 
 ### Index Creation
 
 `create_index()` / `createIndex()` creates a `deeplake_index` on a column. Use it for:
 - **EMBEDDING columns** — enables vector cosine similarity search via `<#>`
-- **TEXT columns** — enables BM25 text search via `<#>`
+- **TEXT columns** — enables BM25 ranking or keyword `CONTAINS` lookups
 
-The method executes `CREATE INDEX IF NOT EXISTS ... USING deeplake_index (column)` and is a no-op if the index already exists.
+The method executes `CREATE INDEX IF NOT EXISTS ... USING deeplake_index (column)
+WITH (index_type = '…')`.
+
+#### Index types — and why the default is usually wrong for a clone
+
+| Column kind        | Accepted `index_type`                                | Default when omitted |
+| ------------------ | ---------------------------------------------------- | -------------------- |
+| text               | `exact_text`, `bm25`, `inverted_index`               | **`exact_text`**     |
+| embedding (1-D)    | `clustered`, `clustered_quantized`                   | `clustered`          |
+| embedding (2-D)    | `pooled_quantized`                                   | `pooled_quantized`   |
+| numeric            | `inverted_index`                                     | `inverted_index`     |
+| json / dict        | `inverted_index`                                     | `inverted_index`     |
+| any                | `unique`                                             | —                    |
+
+Aliases accepted: `inverted` → `inverted_index`, `exact` → `exact_text`,
+`quantized` / `binary_quantized` → `clustered_quantized`.
+
+> **⚠️ The text default does not match most real datasets.** A bare
+> `create_index(table, "text")` builds `exact_text`, which serves only `col = 'x'`
+> equality. Source datasets are typically `inverted_index` (keyword `CONTAINS`)
+> or `bm25` (full-text ranking). Cloning a dataset's indexes means passing the
+> type explicitly — read it from `describe_table()` rather than guessing.
 
 ```python
 # Python — standalone
-client.create_index("embeddings", "embedding")  # vector index
-client.create_index("documents", "text")         # text index
+client.create_index("documents", "text", index_type="bm25")       # full-text ranking
+client.create_index("documents", "keywords", index_type="inverted_index")
+client.create_index("embeddings", "embedding", index_type="clustered")
+
+# A clustered index over a bare float4[] column that has no rows yet needs the
+# dimension supplied — there is nothing to infer it from.
+client.create_index("skeleton", "embedding",
+                    index_type="clustered", dimension=1536)
 
 # Python — during ingestion (creates indexes after data is committed)
 client.ingest("search_index", {
     "text": documents,
     "embedding": embeddings,
-}, index=["embedding", "text"])
+}, index={"text": "bm25", "embedding": "clustered"})
 ```
 
 ```typescript
 // Node.js — standalone
-await client.createIndex("embeddings", "embedding");
-await client.createIndex("documents", "text");
+await client.createIndex("documents", "text", { indexType: "bm25" });
+await client.createIndex("embeddings", "embedding", { indexType: "clustered" });
+await client.createIndex("skeleton", "embedding",
+                         { indexType: "clustered", dimension: 1536 });
 
 // Node.js — during ingestion
 await client.ingest("search_index", {
     text: documents,
     embedding: embeddings,
-}, { index: ["embedding", "text"] });
+}, { index: { text: "bm25", embedding: "clustered" } });
 ```
+
+The `index=` argument accepts three shapes, in both `ingest()` and `create_table()`:
+
+| Form | Meaning |
+| ---- | ------- |
+| `["embedding", "text"]` | default index type per column kind |
+| `{"embedding": "clustered", "text": "bm25"}` | explicit type per column |
+| `{"embedding": {"index_type": "clustered", "dimension": 1536}}` | full control |
+
+#### Changing an existing index type
+
+pg_deeplake allows **one index per column**. `CREATE INDEX IF NOT EXISTS` on a
+column that is already indexed is skipped by PostgreSQL before pg_deeplake ever
+sees it — so re-running with a corrected `index_type` would silently do nothing.
+The client checks for this and raises instead:
+
+```python
+client.create_index("docs", "text", index_type="bm25")
+# TableError: Column 'text' of table 'docs' already has a 'exact_text' index
+# (idx_docs_text), which does not match the requested 'bm25'. CREATE INDEX
+# would skip it silently. Resolution: client.drop_index('docs', 'text') first.
+
+client.drop_index("docs", "text")
+client.create_index("docs", "text", index_type="bm25")   # now takes effect
+```
+
+Re-requesting the **same** type is a no-op, so `create_table(..., index=...)` is
+safe to re-run.
+
+> **⚠️ Changing a type does not reliably take on the managed service yet.**
+> `DROP INDEX` removes the PostgreSQL catalog entry immediately, but each
+> backend pod holds its own copy of the deeplake index and drops it on its own
+> schedule. A `create_index` with the new type issued straight afterwards is
+> rejected by a pod that has not caught up — as "already exists" or as a type
+> conflict — often for longer than the client's ~10s retry budget. Measured
+> against api-beta: succeeds roughly 1 run in 5.
+>
+> The client absorbs the short cases and, when it runs out of attempts, **raises
+> rather than reporting an index it did not create** — so you never end up
+> believing a column is indexed when it is not. If you hit it, wait and retry,
+> or create the table with the index type you want from the start. Verify with
+> `describe_table()`, which reads storage rather than the catalog.
+
+### Reading a table's real schema and indexes
+
+`describe_table()` opens the table read-only and reports what storage actually
+holds — not what was requested at creation time. The built index type is not
+exposed anywhere else in the Python/JS API (it is spliced into the type string
+that `Dataset.summary()` prints), so this is the only way to read it.
+
+```python
+client.describe_table("embedding_noquantized")
+# {'chunk_id':   {'type': 'text (compression=lz4)',      'index': 'inverted_index'},
+#  'created_at': {'type': 'int64',                       'index': None},
+#  'embedding':  {'type': 'embedding(1536, clustered)',  'index': 'clustered'},
+#  'id':         {'type': 'text (compression=lz4)',      'index': 'inverted_index'}}
+```
+
+Feed that straight back into `create_table` to clone a schema — see
+[examples.md](examples.md) for the full skeleton recipe.
+
+> **Caveat:** a clone reproduces column types, dimensions and index types, but
+> **not chunk compression** — pg_deeplake hardwires a PG `TEXT` column to
+> `text(compression=null)`, so an SDK-created source showing `compression=lz4`
+> will differ there. Storage size only; semantics and queries are unaffected.
+
+> **Note:** a freshly created table takes a moment to become visible on every
+> backend pod. `create_index` absorbs that window automatically (bounded retry
+> on "does not have DeepLake access method" / "does not exist"), so
+> `create_table(..., index=...)` is safe to call in one shot.
 
 ---
 
@@ -786,9 +1006,42 @@ User wants to ingest data
 |          "vector": "EMBEDDING",
 |      })
 |
+|
+|-- Need the table to exist BEFORE any data? (skeleton, INSERT…SELECT target)
+|   `-- client.create_table("table", {"id": "TEXT", "embedding": "EMBEDDING(1536)"},
+|          index={"id": "inverted_index", "embedding": "clustered"})
+|      Use EMBEDDING(dim), not bare EMBEDDING — an empty table has no rows to
+|      infer the dimension from.
+|
 `-- Need indexes for search performance?
     `-- client.ingest("table", {...}, index=["embedding", "text"])
-       Or standalone: client.create_index("table", "embedding")
+       Explicit types:  index={"text": "bm25", "embedding": "clustered"}
+       Or standalone:   client.create_index("table", "embedding",
+                                            index_type="clustered")
+       The text default is exact_text (equality only) — pass bm25 or
+       inverted_index if that is what you actually want.
+```
+
+### Decision: Reproduce Another Dataset's Schema
+
+```
+Need a table with the same columns AND indexes as an existing dataset
+|
+|-- 1. Read the source (read-only — never take write access to inspect)
+|      src = client.describe_table("source_table")
+|      -> {col: {"type": "embedding(1536, clustered)", "index": "clustered"}}
+|
+|-- 2. Translate deeplake types -> schema types
+|      "embedding(1536, ...)"  -> "EMBEDDING(1536)"   # keep the dimension!
+|      "text (compression=…)"  -> "TEXT"
+|      "int64"                 -> "INT64"
+|
+|-- 3. Carry each column's index type across verbatim
+|      index = {c: i["index"] for c, i in src.items() if i["index"]}
+|
+`-- 4. client.create_table("skeleton", schema, index=index)
+       Verify:  client.describe_table("skeleton") == src
+       See examples.md Workflow 10 for the complete script.
 ```
 
 ### Decision: How to Query Data
@@ -803,14 +1056,19 @@ User wants to query data
 |   `-- Node raw:      await client.query("SELECT * FROM table LIMIT 100")
 |
 |-- Large result set (streaming)?
-|   `-- Use client.open_table("table") for direct dataset access
+|   `-- Use client.open_table("table", read_only=True) for direct dataset access
 |      with batch iteration, PyTorch/TF DataLoaders, etc.
 |
 |-- Need semantic/vector search?
-|   `-- client.query("""
-|          SELECT *, embedding <#> $1 AS score
+|   `-- from deeplake.managed import vector_literal
+|      client.query(f"""
+|          SELECT *, embedding::float4[] <#> {vector_literal(query_embedding)} AS score
 |          FROM table ORDER BY score DESC LIMIT 10
-|      """, (query_embedding,))
+|      """)
+|      Through client.query() a vector CANNOT be passed as $1 -- the REST API
+|      serializes it to a string that arrives at the DuckDB executor as
+|      VARCHAR. Inline it. Scalars/text as $1 are fine. (On a direct psql /
+|      asyncpg / psycopg connection $1::float4[] binds a real array and works.)
 |
 |-- Need text search?
 |   `-- client.query("""
@@ -819,11 +1077,12 @@ User wants to query data
 |      """, ("keyword",))
 |
 `-- Need hybrid search (vector + text)?
-    `-- client.query("""
+    `-- client.query(f"""
            SELECT *, (embedding, text)::deeplake_hybrid_record <#>
-           deeplake_hybrid_record($1, $2, 0.7, 0.3) AS score
+           deeplake_hybrid_record({vector_literal(query_emb)}, $1, 0.7, 0.3) AS score
            FROM table ORDER BY score DESC LIMIT 10
-       """, (query_emb, "search text"))
+       """, ("search text",))
+       Vector inlined; the text argument can stay a parameter.
 ```
 
 ### Decision: User Wants to Train on Data
@@ -832,7 +1091,7 @@ User wants to query data
 User wants to train / iterate over data
 |
 |-- Fast native batch iteration (RECOMMENDED for large datasets)?
-|   |-- ds = client.open_table("table")
+|   |-- ds = client.open_table("table", read_only=True)
 |   |   for batch in ds.batches(256):  # dict of numpy arrays
 |   |       states = torch.tensor(np.stack([batch[c] for c in cols], axis=1))
 |   |-- For column subsets, use query first:
@@ -840,17 +1099,17 @@ User wants to train / iterate over data
 |   `   for batch in view.batches(256): ...
 |
 |-- Need PyTorch DataLoader (small datasets or need shuffle)?
-|   `-- ds = client.open_table("table")
+|   `-- ds = client.open_table("table", read_only=True)
 |      loader = DataLoader(ds.pytorch(), batch_size=32, shuffle=True)
 |      NOTE: Slower on large remote datasets — prefer ds.batches() above
 |
 |-- Need TensorFlow tf.data?
-|   `-- ds = client.open_table("table")
+|   `-- ds = client.open_table("table", read_only=True)
 |      tf_ds = ds.tensorflow().batch(32).prefetch(AUTOTUNE)
 |
 `-- Training on LeRobot data?
     |-- Behavior cloning (state->action):
-    |   ds = client.open_table("droid_frames")
+    |   ds = client.open_table("droid_frames", read_only=True)
     |   view = ds.query("SELECT state_x, ..., action_x, ... WHERE episode_index < 100")
     |   for batch in view.batches(256):
     |       states = torch.tensor(np.stack([batch[c] for c in STATE_COLS], axis=1))
@@ -858,7 +1117,7 @@ User wants to train / iterate over data
     |       # train(model, states, actions)
     |
     `-- Video-conditioned training:
-        ds = client.open_table("droid_episodes")
+        ds = client.open_table("droid_episodes", read_only=True)
         # Access video bytes via ds[i]["exterior_1_video"], etc.
 ```
 
@@ -883,7 +1142,28 @@ Operation failed with error
 |   |-- "create_deeplake_table failed" -> Check pg_deeplake extension
 |   |-- "Table already exists" -> Use drop_table() first or different name
 |   |-- "Index creation failed" -> Check column exists and is EMBEDDING or TEXT type
+|   |-- "already has index ... does not match the requested" ->
+|   |      One index per column. client.drop_index(table, col), then recreate.
+|   |-- "Invalid index type 'X' for text column" ->
+|   |      Use exact_text | bm25 | inverted_index (embeddings: clustered |
+|   |      clustered_quantized | pooled_quantized)
+|   |-- "does not have DeepLake access method" right after create_table ->
+|   |      Backend pod hasn't caught up. create_index already retries; if you
+|   |      hit it elsewhere, wait a few seconds and retry.
+|   |-- "not float32 array, hence not supported yet for indexing" ->
+|   |      Column is not an embedding. Declare it EMBEDDING(dim), or pass
+|   |      dimension= when indexing a bare float4[] column.
 |   `-- "Query timed out" -> Increase timeout: client.query(sql, timeout=300)
+|
+|-- ValueError: "Unknown index_type"?
+|   `-- Valid: inverted_index, bm25, exact_text, clustered,
+|      clustered_quantized, pooled_quantized, unique
+|
+|-- Skeleton table's column came back as TEXT instead of a vector?
+|   `-- Schema said "EMBEDDING" (no dimension). Use "EMBEDDING(1536)".
+|
+|-- ReadOnlyDatasetModificationError / AttributeError on append?
+|   `-- The handle came from open_table(..., read_only=True). Reopen without it.
 |
 |-- WorkspaceError / "workspace ID is required"?
 |   `-- POST /workspaces requires the "id" field in the request body.

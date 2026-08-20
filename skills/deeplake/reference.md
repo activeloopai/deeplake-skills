@@ -8,32 +8,71 @@ Once data is ingested, use these SQL features:
 
 The `<#>` operator is overloaded by pg_deeplake -- it performs **vector cosine similarity** when applied to embedding columns and **BM25 text similarity** when applied to text columns. In both cases, higher scores = more similar, so use `ORDER BY ... DESC`.
 
+**Cast the vector column:** write `embedding::float4[] <#> ...`, with a cast on
+both sides. `EMBEDDING(n)` is a domain over `float4[]`, and `<#>` is overloaded
+three ways (vector, BM25 text, hybrid record); spelling the left operand out is
+the form that resolves in every client, rather than relying on the domain being
+smashed to its base type. The cast costs nothing -- it is a relabel, not a copy
+-- and it does not stop the index from being used.
+
 **Note:** Unlike pgvector's `<=>` (distance, lower = closer), pg_deeplake's `<#>` returns **similarity** (higher = more similar). Always use `ORDER BY ... DESC`.
 
 ```sql
 -- <#> on embedding column: cosine similarity (higher = more similar)
-SELECT id, text, embedding <#> $query_embedding AS similarity
+SELECT id, text, embedding::float4[] <#> $query_embedding AS similarity
 FROM documents
 ORDER BY similarity DESC
 LIMIT 10;
 ```
 
+> **⚠️ Through `client.query()` a vector cannot be a query parameter — inline
+> it.** Passing a list as `$1` fails: the REST query API serializes it to a
+> PostgreSQL array *string*, which reaches the DuckDB executor typed `VARCHAR`,
+> and DuckDB refuses to convert that to `FLOAT4[]`:
+>
+> ```
+> Conversion Error: Type VARCHAR with value '{0.55,0.03,…}' can't be cast to FLOAT4[]
+> ```
+>
+> Adding `$1::FLOAT4[]` or `CAST($1 AS FLOAT4[])` does **not** help — the cast
+> applies to the VARCHAR DuckDB already declined. Use `vector_literal()` /
+> `vectorLiteral()` to inline the vector instead. Scalar and text parameters are
+> unaffected (`WHERE id = $1` and BM25's `text <#> $1` both work); only
+> array-valued parameters are.
+>
+> This is specific to the REST query API. A **direct** PostgreSQL connection
+> (psql, asyncpg, psycopg) binds a real `float4[]`, so `emb <#> $1::float4[]`
+> works there — which is why the SQL guides show that form.
+
 **Python example:**
 ```python
-import numpy as np
+from deeplake.managed import vector_literal
 
-query_embedding = model.encode("search query").tolist()  # Must be list, not numpy array
+query_embedding = model.encode("search query").tolist()
 
-results = client.query("""
-    SELECT id, text, embedding <#> $1 AS similarity
+results = client.query(f"""
+    SELECT id, text, embedding::float4[] <#> {vector_literal(query_embedding)} AS similarity
     FROM embeddings
     ORDER BY similarity DESC
     LIMIT 10
-""", (query_embedding,))
+""")
 
 for row in results:
     print(f"{row['similarity']:.3f}: {row['text']}")
 ```
+
+```typescript
+import { vectorLiteral } from 'deeplake';
+
+const rows = await client.query(`
+    SELECT id, text, embedding::float4[] <#> ${vectorLiteral(queryEmbedding)} AS similarity
+    FROM embeddings ORDER BY similarity DESC LIMIT 10
+`);
+```
+
+`vector_literal()` renders each value with `repr()` so the vector round-trips
+exactly — a self-similarity query returns `1.0`. A 1536-d vector produces
+roughly a 30 KB literal, which the query API accepts without trouble.
 
 ### BM25 Text Search
 
@@ -73,7 +112,7 @@ WHERE text @> 'important keyword';
 -- Weights: 0.7 = 70% vector similarity, 0.3 = 30% BM25 text similarity
 SELECT id,
        (embedding, text)::deeplake_hybrid_record <#>
-       deeplake_hybrid_record($query_embedding, 'search text', 0.7, 0.3) AS score
+       deeplake_hybrid_record(ARRAY[0.1, 0.2, ...]::FLOAT4[], 'search text', 0.7, 0.3) AS score
 FROM documents
 ORDER BY score DESC
 LIMIT 10;
@@ -81,16 +120,23 @@ LIMIT 10;
 
 **Python example:**
 ```python
+from deeplake.managed import vector_literal
+
 query_emb = model.encode("neural networks").tolist()
-results = client.query("""
+results = client.query(f"""
     SELECT id, text,
            (embedding, text)::deeplake_hybrid_record <#>
-           deeplake_hybrid_record($1, $2, 0.7, 0.3) AS score
+           deeplake_hybrid_record({vector_literal(query_emb)}, $1, 0.7, 0.3) AS score
     FROM documents
     ORDER BY score DESC
     LIMIT 10
-""", (query_emb, "neural networks"))
+""", ("neural networks",))
 ```
+
+> The vector argument must be inlined here too — `deeplake_hybrid_record($1, $2, …)`
+> fails with the same `Conversion Error` described under
+> [Vector Similarity Search](#vector-similarity-search). The **text** argument
+> can stay a parameter.
 
 ### Create Indexes for Performance
 
@@ -99,27 +145,111 @@ results = client.query("""
 CREATE INDEX ON documents USING deeplake_index (embedding);
 
 -- Text index (speeds up BM25 search)
-CREATE INDEX ON documents USING deeplake_index (text);
+CREATE INDEX ON documents USING deeplake_index (text) WITH (index_type = 'bm25');
 ```
 
 **Via SDK (recommended):**
 
 ```python
 # Python — standalone
-client.create_index("documents", "embedding")
-client.create_index("documents", "text")
+client.create_index("documents", "embedding", index_type="clustered")
+client.create_index("documents", "text", index_type="bm25")
 
 # Python — during ingestion
-client.ingest("documents", data, index=["embedding", "text"])
+client.ingest("documents", data, index={"embedding": "clustered", "text": "bm25"})
 ```
 
 ```typescript
 // Node.js — standalone
-await client.createIndex("documents", "embedding");
-await client.createIndex("documents", "text");
+await client.createIndex("documents", "embedding", { indexType: "clustered" });
+await client.createIndex("documents", "text", { indexType: "bm25" });
 
 // Node.js — during ingestion
-await client.ingest("documents", data, { index: ["embedding", "text"] });
+await client.ingest("documents", data,
+    { index: { embedding: "clustered", text: "bm25" } });
+```
+
+### Index Types
+
+`WITH (index_type = '…')` selects which index pg_deeplake builds. The SDK's
+`index_type=` / `indexType:` argument maps 1:1 onto this option, and the names
+are the same ones `Dataset.summary()` prints in its `index=` suffix — so an
+index type read off one dataset can be replayed onto another verbatim.
+
+| `index_type`          | Valid on            | Enables                                                  |
+| --------------------- | ------------------- | -------------------------------------------------------- |
+| `exact_text`          | text                | Equality only: `WHERE col = 'x'` **(text default)**       |
+| `bm25`                | text                | Full-text ranking: `text <#> 'query'`, `BM25_SIMILARITY`  |
+| `inverted_index`      | text, numeric, json | Keyword / containment lookups: `CONTAINS(col, 'x')`       |
+| `clustered`           | embedding (1-D)     | Cosine similarity `<#>` **(embedding default)**           |
+| `clustered_quantized` | embedding (1-D)     | Same, binary-quantized — faster, slightly less accurate   |
+| `pooled_quantized`    | embedding (2-D)     | ColBERT-style `MAXSIM` over an embeddings matrix          |
+| `unique`              | any                 | Column-level uniqueness enforced at commit time           |
+
+Aliases: `inverted` → `inverted_index`, `exact` → `exact_text`,
+`quantized` / `binary_quantized` → `clustered_quantized`.
+
+**Defaults when `index_type` is omitted** — text `exact_text`, 1-D embedding
+`clustered`, 2-D embedding `pooled_quantized`, numeric/json `inverted_index`.
+
+> **⚠️ The text default is `exact_text`, which is rarely what a source dataset
+> carries.** `exact_text` serves only `col = 'x'`; it returns nothing for
+> `CONTAINS` or BM25 ranking. Most datasets built through the SDK carry
+> `inverted_index` or `bm25` on their text columns. If you are reproducing an
+> existing dataset, read the source's types with `client.describe_table()` and
+> pass them explicitly — a bare `create_index` will silently produce a
+> *different* index with no error.
+
+**`WITH (dimension = N)`** — supplies the vector dimension when building a
+clustered index over a plain `float4[]` column. Only needed when that column has
+no rows to infer the length from (i.e. an empty skeleton table). A real
+`EMBEDDING(dim)` column already carries its dimension.
+
+> **An `EMBEDDING(N)` column arrives with a `clustered` index already attached.**
+> `CREATE TABLE … emb EMBEDDING(1536)` alone yields
+> `embedding(1536, clustered, index=clustered)` — no `CREATE INDEX` required.
+> Re-requesting `clustered` is a no-op, but requesting `clustered_quantized` on
+> that column is refused (`Conflicting index types for column 'emb'`), because
+> the index type is baked into the column type. For a quantized index, declare
+> the column as plain `float4[]` (SDK `"EMBEDDING"`) and pass the dimension when
+> creating the index.
+
+```sql
+CREATE INDEX idx_emb ON memories USING deeplake_index (content_embedding)
+    WITH (index_type = 'clustered', dimension = 1536);
+```
+
+**One index per column.** pg_deeplake rejects a second index on an
+already-indexed column, and `CREATE INDEX IF NOT EXISTS` is skipped by
+PostgreSQL before pg_deeplake ever sees the conflicting type. To change a
+column's index type, drop it first:
+
+```python
+client.drop_index("documents", "text")
+client.create_index("documents", "text", index_type="bm25")
+```
+
+### Reading back which index a column has
+
+The built index type is not exposed on `ColumnDefinition` — `dataset_view::summary()`
+splices it into the printed type string as an `index=` suffix, and `summary()`
+prints rather than returns. `client.describe_table()` / `client.describeTable()`
+parse it back out:
+
+```python
+client.describe_table("documents")
+# {'text':      {'type': 'text (compression=lz4)',     'index': 'bm25'},
+#  'embedding': {'type': 'embedding(1536, clustered)', 'index': 'clustered'}}
+```
+
+The SQL catalog is a cheaper but *partial* alternative — it shows the requested
+`WITH` options, not the built index, and says nothing when the index was created
+with the default:
+
+```sql
+SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'documents';
+-- CREATE INDEX idx_documents_text ON "default".documents
+--     USING deeplake_index (text) WITH (index_type=bm25)
 ```
 
 ### Raw SQL: Inserting Image Bytes
@@ -144,7 +274,7 @@ client.query(
 When using vector values as SQL literals (e.g. for benchmarking without parameterized queries):
 
 ```sql
-SELECT id, text, embedding <#> ARRAY[0.1, 0.2, 0.3]::FLOAT4[] AS score
+SELECT id, text, embedding::float4[] <#> ARRAY[0.1, 0.2, 0.3]::FLOAT4[] AS score
 FROM documents
 ORDER BY score DESC
 LIMIT 10;
@@ -168,7 +298,8 @@ LIMIT 10;
 | `BINARY`       | bytes       | Buffer/Uint8Array | bytea                     | `b"\x00\x01"`           |
 | `IMAGE`        | bytes       | Buffer/Uint8Array | IMAGE (bytea)             | Image binary data       |
 | `VIDEO`        | bytes       | Buffer/Uint8Array | bytea                     | Video binary data       |
-| `EMBEDDING`    | list[float] | number[]          | float4[]                  | `[0.1, 0.2, 0.3]`       |
+| `EMBEDDING`    | list[float] | number[]          | float4[] (variable length) | `[0.1, 0.2, 0.3]`      |
+| `EMBEDDING(N)` | list[float] | number[]          | EMBEDDING(N) → `embedding(N, float32)` | `[0.1, …]` (exactly N) |
 | `SEGMENT_MASK` | bytes       | Buffer/Uint8Array | SEGMENT_MASK (bytea)      | Segmentation mask data  |
 | `BINARY_MASK`  | bytes       | Buffer/Uint8Array | BINARY_MASK (bytea)       | Binary mask data        |
 | `BOUNDING_BOX` | list[float] | number[]          | BOUNDING_BOX (float4[])   | `[x, y, w, h]`          |
@@ -180,7 +311,22 @@ LIMIT 10;
 | `LINK(target)` | bytes       | Buffer/Uint8Array | LINK (bytea)              | Reference to external data (see [LINK Types](#link-types-and-roundtrip)) |
 | `FILE`         | str (path)  | string (path)     | N/A (processed)           | `"/path/to/file.mp4"`   |
 
-> **Note:** `EMBEDDING` is a Deeplake schema type that maps to `float4[]` in PostgreSQL. pg_deeplake treats these columns specially for vector similarity search via the `<#>` operator and `deeplake_index`.
+> **Note:** `EMBEDDING` and `EMBEDDING(N)` are **not** interchangeable.
+> Bare `EMBEDDING` maps to a plain `float4[]` — a *variable-length* float array
+> per row, which pg_deeplake stores as a generic array rather than a vector
+> column. `EMBEDDING(N)` maps to the `EMBEDDING` domain with a typmod, which
+> pg_deeplake resolves to a real `embedding(N, float32)` column.
+>
+> Both support `<#>` and `deeplake_index`, but they differ where it matters:
+> a clustered index on a bare `float4[]` column has to *infer* the dimension
+> from existing rows, so on an **empty** table it fails unless you pass
+> `dimension=`. Prefer `EMBEDDING(N)` whenever you know the dimension —
+> especially when creating a table before loading data.
+>
+> **Unknown type names pass through to PostgreSQL verbatim.** `SMALLINT`,
+> `TEXT[]`, `NUMERIC(10,2)` and friends all work in `schema=`. (Previously
+> anything outside the table above silently became `TEXT`, so
+> `"EMBEDDING(1536)"` produced a text column with no error.)
 >
 > **Note:** `FILE` is a schema directive, not a storage type. Columns marked as `FILE` are treated as file paths during ingestion -- the files are processed (chunked, etc.) and the resulting data is stored in generated columns. The `FILE` column itself is not stored in the dataset.
 >
@@ -393,25 +539,32 @@ non-deeplake tables.
 
 ### Via the managed API
 
-The `Client._create_table_via_api(...)` + `Client.query("SECURITY LABEL …")`
-pair from `deeplake.managed.Client` is the canonical way to drive this
-from Python for a fleet of client datasets:
+The `Client.create_table(...)` + `Client.query("SECURITY LABEL …")` pair from
+`deeplake.managed.Client` is the canonical way to drive this from Python for a
+fleet of client datasets:
 
 ```python
 client = Client(token=TOKEN, api_url=API_URL,
                 workspace_id="default", org_id=ORG_ID)
 deeplake.client.endpoint = API_URL
 
-client._create_table_via_api(
-    table_name="my_attached",
-    dataset_path="",                # server-derived; retarget below
-    pg_schema={"smask": "SEGMENT_MASK", "lz4_smask": "SEGMENT_MASK", ...},
-)
+client.create_table("my_attached", {
+    "smask": "SEGMENT_MASK",
+    "lz4_smask": "SEGMENT_MASK",
+    "zlib_smask": "SEGMENT_MASK",
+    "png_smask": "SEGMENT_MASK",
+})
 client.query("SECURITY LABEL FOR deeplake ON TABLE my_attached "
              "IS 'physical_name=levon_testing_type_withour_compression_1'")
 rows = client.query("SELECT smask, lz4_smask, zlib_smask, png_smask "
                     "FROM my_attached")
 ```
+
+> Older revisions of this guide reached for the private
+> `client._create_table_via_api(...)` because no public equivalent existed.
+> `create_table()` supersedes it — same REST call, plus schema-type resolution,
+> alphabetical column ordering (which the DuckDB scanner requires), and
+> optional index creation.
 
 For migration scripts that loop over many existing client datasets, see
 the dedicated skill `pg-deeplake-attach-typed-datasets`, which has the
