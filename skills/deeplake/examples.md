@@ -45,15 +45,21 @@ client.ingest("search_index", {
     "embedding": embeddings,
 }, index=["embedding", "text"])
 
-# Search (uses deeplake_index automatically)
+# Search (uses deeplake_index automatically).
+# Through client.query() the query vector must be INLINED — the REST API
+# serializes an array parameter to a string, and passing it as $1 fails with
+# "Conversion Error: Type VARCHAR ... can't be cast to FLOAT4[]". (On a direct
+# psql / asyncpg / psycopg connection $1::float4[] binds a real array and works.)
+from deeplake.managed import vector_literal
+
 query_emb = [0.15]*384  # Placeholder
 
-results = client.query("""
-    SELECT text, embedding <#> $1 AS similarity
+results = client.query(f"""
+    SELECT text, embedding::float4[] <#> {vector_literal(query_emb)} AS similarity
     FROM search_index
     ORDER BY similarity DESC
     LIMIT 5
-""", (query_emb,))
+""")
 
 for r in results:
     print(f"{r['similarity']:.3f}: {r['text']}")
@@ -91,7 +97,7 @@ from deeplake import Client
 client = Client()
 
 # Use open_table() for large-scale iteration (bypasses PostgreSQL)
-ds = client.open_table("large_table")
+ds = client.open_table("large_table", read_only=True)
 for batch in ds.batches(1000):
     process(batch)
 ```
@@ -198,7 +204,7 @@ for f in frames:
     print(f"Frame {f['frame_index']}: state=({f['state_x']:.3f}, {f['state_y']:.3f})")
 
 # Connect to training — open_table() bypasses SQL, returns native dataset
-ds = client.open_table("droid_frames")
+ds = client.open_table("droid_frames", read_only=True)
 print(f"Dataset: {len(ds)} frames")
 
 # RECOMMENDED: Use ds.query() + ds.batches() for fast training on large datasets.
@@ -284,7 +290,7 @@ const tables = await client.listTables();
 console.log("Tables:", tables);
 ```
 
-### Workflow 8: Node.js -- Ingest Structured Data (TypeScript)
+### Workflow 9: Node.js -- Ingest Structured Data (TypeScript)
 
 ```typescript
 import { ManagedClient, initializeWasm } from 'deeplake';
@@ -302,19 +308,188 @@ await client.ingest("embeddings", {
     score: [0.9, 0.8],
 });
 
-// Vector similarity search
+// Vector similarity search — through client.query() the vector must be
+// inlined; the REST API serializes an array parameter to a string.
+import { vectorLiteral } from 'deeplake';
+
 const queryEmb = [0.15, 0.25, 0.35];
 const results = await client.query(
-    `SELECT text, embedding <#> $1 AS similarity
+    `SELECT text, embedding::float4[] <#> ${vectorLiteral(queryEmb)} AS similarity
      FROM embeddings
      ORDER BY similarity DESC
      LIMIT 5`,
-    [queryEmb],
 );
 
 for (const r of results) {
     console.log(`${r.similarity}: ${r.text}`);
 }
+```
+
+---
+
+### Workflow 10: Clone a Dataset's Schema and Indexes (Python)
+
+Build an empty "skeleton" table whose columns **and index types** match an
+existing dataset — the shape you want before a migration, a backfill, or an
+`INSERT INTO … SELECT`.
+
+Two things make a naive attempt silently wrong:
+
+1. **`EMBEDDING` without a dimension** becomes a variable-length `float4[]`,
+   not an `embedding(1536, …)` column. An empty table has no rows to infer the
+   dimension from, so this is unrecoverable later.
+2. **`create_index` without `index_type`** uses pg_deeplake's default, which for
+   text is `exact_text` — while real datasets usually carry `inverted_index` or
+   `bm25`. Nothing errors; the clone just behaves differently under search.
+
+```python
+from deeplake import Client
+
+client = Client(workspace_id="my-workspace")
+
+SOURCE = "embedding_noquantized"
+TARGET = "embedding_skeleton"
+
+# 1. Read the source's real column types AND built index types.
+#    describe_table opens read-only — inspecting must never take write access.
+src = client.describe_table(SOURCE)
+for col, info in src.items():
+    print(f"{col:12s} {info['type']:32s} index={info['index']}")
+# chunk_id     text (compression=lz4)           index=inverted_index
+# created_at   int64                            index=None
+# embedding    embedding(1536, clustered)       index=clustered
+# id           text (compression=lz4)           index=inverted_index
+
+
+# 2. Translate deeplake type strings -> SDK schema types.
+def to_schema_type(deeplake_type: str) -> str:
+    if deeplake_type.startswith("embedding("):
+        # "embedding(1536, clustered)" -> "EMBEDDING(1536)".  Keeping the
+        # dimension is the whole point: bare EMBEDDING loses it.
+        dim = deeplake_type[len("embedding("):].split(",")[0].rstrip(")")
+        return f"EMBEDDING({dim.strip()})"
+    if deeplake_type.startswith("text"):
+        return "TEXT"
+    if deeplake_type in ("int64", "int32", "float32", "float64", "bool"):
+        return deeplake_type.upper()
+    if deeplake_type.startswith("image"):
+        return "IMAGE"
+    raise ValueError(f"add a mapping for {deeplake_type!r}")
+
+
+schema = {col: to_schema_type(info["type"]) for col, info in src.items()}
+# Carry each column's index type across verbatim — describe_table reports the
+# same names create_index accepts, so no translation table is needed.
+index = {col: info["index"] for col, info in src.items() if info["index"]}
+
+client.create_table(TARGET, schema, index=index)
+
+
+# 3. Verify the clone matches. Index types are compared, not just column names.
+dst = client.describe_table(TARGET)
+mismatches = {
+    col: (src[col]["index"], dst.get(col, {}).get("index"))
+    for col in src
+    if src[col]["index"] != dst.get(col, {}).get("index")
+}
+assert not mismatches, f"index type mismatch: {mismatches}"
+print("skeleton matches the source")
+```
+
+> **What a clone can and cannot reproduce.** Column types, dimensions and index
+> types all carry across. **Chunk compression does not.** pg_deeplake hardwires
+> a PG `TEXT` column to `text(compression=null)`, so if the source was created
+> directly with the SDK (`deeplake.create(..., Text(chunk_compression="lz4"))`)
+> its text columns read back as `compression=lz4` while the clone reads
+> `compression=null`. This affects storage size, not semantics or query
+> behaviour — compare the `index` field for correctness, and treat a `type`
+> difference that is only `compression=` as expected. If you need byte-identical
+> storage, create the dataset with the SDK and attach a pg table to it instead
+> (see [reference.md](reference.md#attach-an-existing-dataset)).
+
+**Copying the data in.** The skeleton is a normal managed table, so `ingest()`
+appends to it — the pre-declared schema wins over type inference:
+
+```python
+client.ingest(TARGET, {
+    "id": ids, "chunk_id": chunk_ids,
+    "created_at": timestamps, "embedding": vectors,
+})
+
+# Reads lag writes by a few seconds — poll rather than assuming.
+import time
+expected = len(ids)
+for _ in range(15):
+    n = client.query(f'SELECT COUNT(*) AS n FROM "{TARGET}"')[0]["n"]
+    if n >= expected:
+        break
+    time.sleep(2)
+```
+
+**If a column already has the wrong index**, `create_index` reports it rather
+than silently no-op'ing (`CREATE INDEX IF NOT EXISTS` would skip it):
+
+```python
+client.drop_index(TARGET, "id")
+client.create_index(TARGET, "id", index_type="inverted_index")
+```
+
+**Node.js equivalent:**
+
+```typescript
+const src = await client.describeTable(SOURCE);
+
+const schema: Record<string, string> = {};
+const index: Record<string, string> = {};
+for (const [col, info] of Object.entries(src)) {
+    if (info.type.startsWith('embedding(')) {
+        const dim = info.type.slice('embedding('.length).split(',')[0].replace(')', '');
+        schema[col] = `EMBEDDING(${dim.trim()})`;
+    } else if (info.type.startsWith('text')) {
+        schema[col] = 'TEXT';
+    } else {
+        schema[col] = info.type.toUpperCase();
+    }
+    if (info.index) index[col] = info.index;
+}
+
+await client.createTable(TARGET, schema, { index });
+```
+
+---
+
+### Workflow 11: Read-Only Access for Training and Inspection (Python)
+
+`open_table()` defaults to **read/write**, which takes a writer handle on the
+dataset. Anything that only reads should say so — it prevents a stray
+`append`/`commit` from mutating a table you meant to leave alone.
+
+```python
+# Inspect a table without write access
+ds = client.open_table("training_data", read_only=True)
+ds.summary()
+print(len(ds))
+
+# Training reads only — open read-only
+ds = client.open_table("training_data", read_only=True)
+for batch in ds.batches(256):
+    train_step(batch)
+
+from torch.utils.data import DataLoader
+loader = DataLoader(ds.pytorch(), batch_size=32, shuffle=True, num_workers=4)
+
+# Mutating a read-only handle raises instead of silently succeeding
+ds.append({"id": ["x"]})        # raises
+
+# Writing needs the default handle
+ds_rw = client.open_table("training_data")
+ds_rw.append({"id": ["x"]})
+ds_rw.commit()
+```
+
+```typescript
+// Node.js — second argument is readOnly
+const ds = await client.openTable("training_data", true);
 ```
 
 ---
